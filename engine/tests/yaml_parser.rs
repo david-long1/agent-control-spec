@@ -88,6 +88,11 @@ fn malformed_unsupported_and_duplicate_values_are_rejected() {
         "    value: 18446744073709551616",
         "    value: -9223372036854775809",
         "    value: 0x10000000000000000",
+        "    value: !!bool null",
+        "    value: !!int null",
+        "    value: !!float null",
+        "    value: !!null garbage",
+        "    value: !custom null",
         "    value: {key: one, key: two}",
         "    value: one\n    value: two",
     ] {

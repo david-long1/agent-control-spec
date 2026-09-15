@@ -6,8 +6,8 @@
   loaders now reject duplicate keys, unsupported tags and non-finite values,
   and bound source size, nesting and anchor expansion. YAML merge keys remain
   ordinary keys. Legacy numeric strings and YAML 1.2 boolean spellings retain
-  their types. Numeric fields do not coerce quoted numbers or legacy string
-  forms such as `010` and `1_000`. Invalid `extends` diagnostics retain the field
+  their types. Numeric fields do not coerce strings, including legacy forms
+  such as `010` and `1_000`. Invalid `extends` diagnostics retain the field
   context. The manifest and runtime error APIs are unchanged. Source snippets
   are not included in parser diagnostics.
   Building the engine now requires Rust 1.89. Include this change in the next
