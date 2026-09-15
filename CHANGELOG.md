@@ -11,8 +11,9 @@
   field anywhere in a chain that fetched a document, and refuses in a fetched
   document any filesystem path field (`bundle`, `data`, `data_paths`,
   `policy_path`, `entities_path`, `schema_path`), a rego `query` that is not
-  a plain rule path, an `approval` section, and a rego `bundle_url` unless
-  every URL hop from the root is pinned. The bundled dispatchers refuse every
+  a plain rule path, an `approval` section, and a rego `bundle_url` or
+  annotator `system_prompt_url` unless every URL hop from the root is pinned.
+  The bundled dispatchers refuse every
   host environment read for a URL sourced invocation, provider defaults
   included, and fail closed with `runtime_error:annotation_failed` before
   any request is sent. A pin vouches for the fetched bytes, not for host
@@ -25,7 +26,8 @@
   merges. The mark holds the document to the same rules as one fetched
   through `extends`, so it also returns `Err` for a `*_env` field, a
   filesystem path field, a rego `query` that is not a plain rule path, an
-  `approval` section, or a `bundle_url`, since the mark carries no pin.
+  `approval` section, a `bundle_url`, or a `system_prompt_url`, since the
+  mark carries no pin.
   `Manifest` equality now includes provenance: a marked manifest is not
   equal to the same text unmarked. It ignores how the value was built, so a
   local manifest read from a file still equals the same text parsed. A
@@ -45,6 +47,10 @@
   Rust hosts that build the struct with a literal must add the field or
   spread `..Default::default()`. Local only chains are unchanged.
   Closes #20.
+- Restore pinned remote prompt and OPA bundle downloads, and propagate host URL
+  limits to bundled dispatchers. Reject invalid or conflicting sources, including
+  for custom-dispatcher hosts. Existing constructor signatures remain supported;
+  Regorus remains the default and rejects remote bundles.
 - Python evaluation no longer holds the GIL. `intercept` and `interceptor_new`
   drop it around engine work, matching what `policy_activate` and
   `policy_evaluate` already did. A manifest with an `llm`, `endpoint` or
