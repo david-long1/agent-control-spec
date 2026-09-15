@@ -85,6 +85,9 @@ fn malformed_unsupported_and_duplicate_values_are_rejected() {
         "    value: {nested: !custom prod}",
         "    value: .nan",
         "    value: .inf",
+        "    value: 18446744073709551616",
+        "    value: -9223372036854775809",
+        "    value: 0x10000000000000000",
         "    value: {key: one, key: two}",
         "    value: one\n    value: two",
     ] {
@@ -104,7 +107,7 @@ fn malformed_unsupported_and_duplicate_values_are_rejected() {
 
 #[test]
 fn legacy_numeric_strings_are_not_reinterpreted_as_limits() {
-    for scalar in ["010", "1_000", "1:2:3"] {
+    for scalar in ["010", "1_000", "1:2:3", "0X10"] {
         let source = format!("{MANIFEST}metadata:\n  value: {scalar}\n");
         let manifest = Manifest::from_yaml_str(&source).unwrap();
         assert_eq!(manifest.metadata["value"], scalar);
