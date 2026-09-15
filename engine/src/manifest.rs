@@ -607,10 +607,11 @@ impl Manifest {
 
         let mut manifests = Vec::with_capacity(inputs.len());
         for (index, input) in inputs.iter().enumerate() {
-            let manifest: Self = serde_yaml::from_str(input).map_err(|err| {
-                RuntimeError::ManifestInvalid(format!(
-                    "failed to parse manifest chain entry {index} as YAML: {err}"
-                ))
+            let manifest = Self::parse_yaml_str(input).map_err(|err| match err {
+                RuntimeError::ManifestInvalid(detail) => RuntimeError::ManifestInvalid(format!(
+                    "failed to parse manifest chain entry {index} as YAML: {detail}"
+                )),
+                other => other,
             })?;
             manifests.push(manifest);
         }
@@ -624,12 +625,58 @@ impl Manifest {
     /// needs to inspect `extends` before deciding whether validation can
     /// give a meaningful answer.
     pub fn parse_yaml_str(input: &str) -> Result<Self, RuntimeError> {
-        serde_yaml::from_str(input).map_err(|err| RuntimeError::ManifestInvalid(err.to_string()))
+        Self::parse_yaml_str_with_limits(input, Limits::default())
+    }
+
+    fn parse_yaml_str_with_limits(input: &str, limits: Limits) -> Result<Self, RuntimeError> {
+        if input.len() > limits.max_merged_manifest_bytes {
+            return Err(RuntimeError::ResourceLimitExceeded(
+                "manifest source exceeds the byte limit".to_string(),
+            ));
+        }
+        // Alias diagnostics can wrap the typed error. Use the structured budget report.
+        let parser_limit = std::rc::Rc::new(std::cell::Cell::new(false));
+        let reported_limit = std::rc::Rc::clone(&parser_limit);
+        serde_saphyr::from_str_with_options(
+            input,
+            serde_saphyr::options! {
+                strict_booleans: true,
+                no_schema: true,
+                reject_unsupported_tags: true,
+                merge_keys: serde_saphyr::MergeKeyPolicy::AsOrdinary,
+                with_snippet: false,
+                budget: serde_saphyr::budget! {
+                    max_depth: limits.max_policy_input_depth,
+                    max_nodes: 100_000,
+                    max_events: 300_000,
+                    max_total_scalar_bytes: limits.max_merged_manifest_bytes,
+                    max_recorded_anchor_bytes: limits.max_merged_manifest_bytes,
+                    max_recorded_anchor_events: 100_000,
+                },
+            }
+            .with_budget_report(move |report| {
+                reported_limit.set(report.breached.is_some());
+            }),
+        )
+        .map_err(|err| {
+            if parser_limit.get()
+                || matches!(
+                    err,
+                    serde_saphyr::Error::Budget { .. }
+                        | serde_saphyr::Error::AliasReplayLimitExceeded { .. }
+                        | serde_saphyr::Error::AliasExpansionLimitExceeded { .. }
+                        | serde_saphyr::Error::AliasReplayStackDepthExceeded { .. }
+                )
+            {
+                RuntimeError::ResourceLimitExceeded(err.to_string())
+            } else {
+                RuntimeError::ManifestInvalid(err.to_string())
+            }
+        })
     }
 
     pub fn from_yaml_str(input: &str) -> Result<Self, RuntimeError> {
-        let manifest: Self = serde_yaml::from_str(input)
-            .map_err(|err| RuntimeError::ManifestInvalid(err.to_string()))?;
+        let manifest = Self::parse_yaml_str(input)?;
         manifest.validate()?;
         Ok(manifest)
     }
@@ -1249,7 +1296,7 @@ impl ManifestLoader {
                 location.label()
             ))
         })?;
-        let mut manifest = parse_manifest_source(&source, &location)?;
+        let mut manifest = parse_manifest_source(&source, &location, self.limits)?;
         validate_extends_entries(&manifest, &location)?;
         if let ManifestLocation::Url(url) = &location {
             // Every fetched body, transitive and relative hops included,
@@ -1417,6 +1464,7 @@ fn canonicalize_manifest_path(
 fn parse_manifest_source(
     source: &str,
     location: &ManifestLocation,
+    limits: Limits,
 ) -> Result<Manifest, RuntimeError> {
     let parse_as_json = location.is_json();
     if parse_as_json {
@@ -1427,11 +1475,12 @@ fn parse_manifest_source(
             ))
         })
     } else {
-        serde_yaml::from_str(source).map_err(|err| {
-            RuntimeError::ManifestInvalid(format!(
-                "failed to parse manifest '{}' as YAML: {err}",
+        Manifest::parse_yaml_str_with_limits(source, limits).map_err(|err| match err {
+            RuntimeError::ManifestInvalid(detail) => RuntimeError::ManifestInvalid(format!(
+                "failed to parse manifest '{}' as YAML: {detail}",
                 location.label()
-            ))
+            )),
+            other => other,
         })
     }
 }
@@ -2703,7 +2752,7 @@ intervention_points:
         let path = root_path(
             "https-bad-sha.yaml",
             &format!(
-                "agent_control_specification_version: 0.4.0-alpha.1\nextends:\n  - url: {url}\n    sha256: {}\n",
+                "agent_control_specification_version: 0.4.0-alpha.1\nextends:\n  - url: {url}\n    sha256: \"{}\"\n",
                 "00".repeat(32)
             ),
         );
@@ -2885,7 +2934,7 @@ intervention_points:
         let local = Manifest::from_path(&local_root).unwrap();
         assert!(!local.url_sourced());
         assert!(local.url_sources().is_empty());
-        let parsed = Manifest::from_yaml_str(&serde_yaml::to_string(&manifest).unwrap()).unwrap();
+        let parsed = Manifest::from_yaml_str(&serde_saphyr::to_string(&manifest).unwrap()).unwrap();
         assert!(!parsed.url_sourced());
     }
 
@@ -2924,7 +2973,7 @@ intervention_points:
 
         let json = serde_json::to_value(&tainted).unwrap();
         assert!(json.get("url_sources").is_none(), "{json}");
-        let yaml = serde_yaml::to_string(&tainted).unwrap();
+        let yaml = serde_saphyr::to_string(&tainted).unwrap();
         assert!(!yaml.contains("url_sources"), "{yaml}");
     }
 
@@ -3002,7 +3051,7 @@ intervention_points:
         // Hop one is pinned, hop two is a bare relative reference, so a
         // remote bundle in hop two is behind an unpinned hop.
         let b_bundle = format!(
-            "agent_control_specification_version: 0.4.0-alpha.1\npolicies:\n  p:\n    type: rego\n    query: data.acs.decision\n    bundle_url:\n      url: https://bundles.example/b.tar.gz\n      sha256: {}\nintervention_points:\n  input:\n    policy_target: $snap.input\n    policy:\n      id: p\n",
+            "agent_control_specification_version: 0.4.0-alpha.1\npolicies:\n  p:\n    type: rego\n    query: data.acs.decision\n    bundle_url:\n      url: https://bundles.example/b.tar.gz\n      sha256: \"{}\"\nintervention_points:\n  input:\n    policy_target: $snap.input\n    policy:\n      id: p\n",
             "00".repeat(32)
         );
         let fetcher = MockFetcher::new(BTreeMap::from([
@@ -3663,7 +3712,7 @@ intervention_points:
     #[test]
     fn fetched_document_bundle_url_requires_pinned_path() {
         let policy_body = format!(
-            "agent_control_specification_version: 0.4.0-alpha.1\npolicies:\n  p:\n    type: rego\n    query: data.acs.decision\n    bundle_url:\n      url: https://bundles.example/b.tar.gz\n      sha256: {}\nintervention_points:\n  input:\n    policy_target: $snap.input\n    policy:\n      id: p\n",
+            "agent_control_specification_version: 0.4.0-alpha.1\npolicies:\n  p:\n    type: rego\n    query: data.acs.decision\n    bundle_url:\n      url: https://bundles.example/b.tar.gz\n      sha256: \"{}\"\nintervention_points:\n  input:\n    policy_target: $snap.input\n    policy:\n      id: p\n",
             "00".repeat(32)
         );
 
@@ -3712,7 +3761,7 @@ intervention_points:
 
         // (d) The key on a fetched binding's adapter_config behaves the same.
         let binding_body = format!(
-            "agent_control_specification_version: 0.4.0-alpha.1\nintervention_points:\n  output:\n    policy_target: $snap.output\n    policy:\n      id: p\n      bundle_url:\n        url: https://bundles.example/b.tar.gz\n        sha256: {}\n",
+            "agent_control_specification_version: 0.4.0-alpha.1\nintervention_points:\n  output:\n    policy_target: $snap.output\n    policy:\n      id: p\n      bundle_url:\n        url: https://bundles.example/b.tar.gz\n        sha256: \"{}\"\n",
             "00".repeat(32)
         );
         let path = root_extending_url(
@@ -3754,7 +3803,7 @@ intervention_points:
     #[test]
     fn fetched_document_system_prompt_url_requires_pinned_path() {
         let prompt_source = format!(
-            "system_prompt_url:\n      url: https://prompts.example/system.txt\n      sha256: {}",
+            "system_prompt_url:\n      url: https://prompts.example/system.txt\n      sha256: \"{}\"",
             "00".repeat(32)
         );
         let declaration_body = format!(

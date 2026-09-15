@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- Parse YAML manifests with `serde-saphyr` 1.2.0. Text, chain and file/URL
+  loaders now reject duplicate keys, unsupported tags and non-finite values,
+  and bound source size, nesting and anchor expansion. YAML merge keys remain
+  ordinary keys. Quote numeric-looking strings, including all-digit SHA-256
+  pins. The manifest and runtime error APIs are unchanged. Source snippets are
+  not included in parser diagnostics.
+  Building the engine now requires Rust 1.89. Include this change in the next
+  coordinated prerelease described in `RELEASING.md`, not a republication of
+  0.4.0-alpha.3. This removes the engine's direct `serde_yaml` dependency.
+  Regorus YAML support remains unchanged and may retain a different YAML
+  implementation when its features are enabled.
 - A manifest chain that fetches any `extends` URL is now URL sourced, and a
   URL sourced manifest may not read host secrets. A fetched document could
   name a host environment variable through `api_key_env` or one of the
