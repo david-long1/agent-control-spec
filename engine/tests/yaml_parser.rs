@@ -52,6 +52,26 @@ fn string_chain_file_and_json_entry_points_agree() {
 }
 
 #[test]
+fn tagged_blocks_preserve_metadata_and_sibling_fields() {
+    for (block, expected) in [
+        ("!!bool |-\n    TRUE", json!(true)),
+        ("!!int >-\n    7", json!(7)),
+        ("!!float |-\n    7", json!(7.0)),
+        ("!!str |-\n    first\n    second", json!("first\nsecond")),
+        ("!!str >-\n    first\n    second", json!("first second")),
+        ("!!null |-\n", json!(null)),
+    ] {
+        let source = format!("{MANIFEST}metadata:\n  value: {block}\n  required: true\n");
+        let manifest = Manifest::from_yaml_str(&source).unwrap();
+        assert_eq!(
+            manifest.metadata,
+            json!({"value": expected, "required": true}),
+            "{block}"
+        );
+    }
+}
+
+#[test]
 fn typed_policy_maps_keep_nested_values_and_aliases() {
     let source = MANIFEST.replace(
         "    type: test",
