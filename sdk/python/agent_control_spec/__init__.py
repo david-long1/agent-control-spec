@@ -9,6 +9,10 @@ never raise into the host: the runtime normalizes them into fail-closed
 ``deny`` verdicts with ``runtime_error:*`` reasons (the engine's own
 reason namespace; the ``host_error:*`` namespace stays reserved for
 hosts, per AGENT-HOOKS-0.1 §5/§11).
+
+Async hosts use :class:`AsyncAcsInterceptor`. :class:`Scope` selects
+which intervention points this control evaluates; :class:`Saturation`
+selects reject or bounded-wait admission.
 """
 
 from __future__ import annotations
@@ -23,7 +27,8 @@ from typing import Any, Self
 from agent_hooks import Verdict
 
 from agent_control_spec import _native
-from agent_control_spec.async_interceptor import AsyncAcsInterceptor, Scope
+from agent_control_spec._evaluation import evaluate_wire as _evaluate_wire
+from agent_control_spec.async_interceptor import AsyncAcsInterceptor, Saturation, Scope
 
 __all__ = [
     "DEFAULT_LIMITS",
@@ -34,6 +39,7 @@ __all__ = [
     "AsyncAcsInterceptor",
     "ManifestInvalidError",
     "RegoBundle",
+    "Saturation",
     "Scope",
     "StreamSession",
     "TelemetryEvent",
@@ -379,10 +385,7 @@ class ActivatedPolicy:
         version does not bind. Raises only on boundary problems: an
         unknown point name or a context that will not serialize.
         """
-        wire = _native.policy_evaluate(
-            self._handle, point, json.dumps(context, allow_nan=False)
-        )
-        return Verdict.from_wire(json.loads(wire))
+        return _evaluate_wire(self._handle, point, json.dumps(context, allow_nan=False))
 
     @property
     def intervention_points(self) -> tuple[str, ...]:

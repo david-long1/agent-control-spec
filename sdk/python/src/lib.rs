@@ -318,10 +318,6 @@ impl TelemetrySink for PyTelemetrySink {
     }
 }
 
-fn resolve_annotator_dispatcher(dispatcher: Option<Py<PyAny>>) -> Arc<dyn AnnotatorDispatcher> {
-    resolve_annotator_dispatcher_with_limits(dispatcher, Limits::default())
-}
-
 fn resolve_annotator_dispatcher_with_limits(
     dispatcher: Option<Py<PyAny>>,
     limits: Limits,
@@ -330,10 +326,6 @@ fn resolve_annotator_dispatcher_with_limits(
         Some(callback) => Arc::new(PyAnnotatorDispatcher { callback }),
         None => default_annotator_dispatcher_with_limits(limits),
     }
-}
-
-fn resolve_policy_dispatcher(dispatcher: Option<Py<PyAny>>) -> Arc<dyn PolicyDispatcher> {
-    resolve_policy_dispatcher_with_limits(dispatcher, Limits::default())
 }
 
 fn resolve_policy_dispatcher_with_limits(
@@ -757,13 +749,13 @@ fn policy_activate(
     limits: Option<Py<PyAny>>,
 ) -> PyResult<PolicyHandle> {
     let manifest_path = manifest_path.to_string();
-    let annotations = resolve_annotator_dispatcher(annotator_dispatcher);
-    let policy = resolve_policy_dispatcher(policy_dispatcher);
     let telemetry =
         resolve_telemetry_sink(telemetry_sink).unwrap_or_else(|| Arc::new(NoopTelemetrySink));
     let perf = wire::parse_perf_telemetry(perf_telemetry)
         .map_err(|e| PyValueError::new_err(format!("{e}")))?;
     let limits = resolve_limits(limits)?;
+    let annotations = resolve_annotator_dispatcher_with_limits(annotator_dispatcher, limits);
+    let policy = resolve_policy_dispatcher_with_limits(policy_dispatcher, limits);
     // Activation is the expensive call and touches no Python object, so
     // it must not hold the GIL: a host activating a new policy version
     // in a background thread would otherwise stall every request thread
@@ -824,13 +816,13 @@ fn policy_activate_from_memory(
         serde_json::from_str(bundles_json)
             .map_err(|e| PyValueError::new_err(format!("bundles do not parse: {e}")))?;
     let manifest_yaml = manifest_yaml.to_string();
-    let annotations = resolve_annotator_dispatcher(annotator_dispatcher);
-    let policy = resolve_policy_dispatcher(policy_dispatcher);
     let telemetry =
         resolve_telemetry_sink(telemetry_sink).unwrap_or_else(|| Arc::new(NoopTelemetrySink));
     let perf = wire::parse_perf_telemetry(perf_telemetry)
         .map_err(|e| PyValueError::new_err(format!("{e}")))?;
     let limits = resolve_limits(limits)?;
+    let annotations = resolve_annotator_dispatcher_with_limits(annotator_dispatcher, limits);
+    let policy = resolve_policy_dispatcher_with_limits(policy_dispatcher, limits);
     // Same reason as `policy_activate`: loading and compiling touches no
     // Python object and must not stall other threads.
     let policy = py.detach(move || {

@@ -35,25 +35,20 @@ reuse the adapter across requests, and close it before shutting down
 that loop.
 
 ```python
-from agent_control_spec import ActivatedPolicy, AsyncAcsInterceptor, Scope
+from agent_control_spec import ActivatedPolicy, AsyncAcsInterceptor
 from agent_hooks import AgentContextBuilder, InterceptionEmitter
 
 policy = ActivatedPolicy.activate("manifest.yaml")  # startup, not per request
 
 
 async def serve():
-    async with AsyncAcsInterceptor(
-        policy,
-        scope=Scope.BOUND_POINTS_ONLY,
-        max_concurrency=8,
-    ) as control:
+    async with AsyncAcsInterceptor(policy, max_concurrency=8) as control:
         emitter = InterceptionEmitter(timeout=1.0).register(control, control.name)
         context = AgentContextBuilder(
             agent_id="example", framework="example", session_id="session-1"
         )
         await emitter.emit(context.agent_startup(tools_registered=["search"]))
-        # For a pre_tool_call-only policy, startup is outside this control.
-        # Its tool policy still decides, and emit raises on a denial.
+        # The manifest must bind each emitted point. emit raises on denial.
         await emitter.emit(
             context.pre_tool_call(call_id="call-1", name="search", args={"q": "x"})
         )
@@ -61,12 +56,17 @@ async def serve():
 
 The default is `Scope.STRICT`: evaluate every point, including unbound
 points, preserving the existing fail-closed behavior.
-`Scope.BOUND_POINTS_ONLY` explicitly allows **known** lifecycle points
-that this activation does not bind. It never catches evaluation errors
+For a deliberately partial control, opt in with
+`AsyncAcsInterceptor(policy, scope=Scope.BOUND_POINTS_ONLY)` after
+importing `Scope` from `agent_control_spec`. This allows **known**
+lifecycle points that this activation does not bind. It never catches evaluation errors
 and turns them into allows. Invalid point names remain boundary errors;
 bound-point runtime failures remain denials. Keep emitting every host
 lifecycle point so other registered controls still run. A scoped allow
 is only this control's verdict, not a global exemption.
+It carries `acs_point_unbound` in the record's per-interceptor
+`verdicts[].reason`, so readers can distinguish a bypass from an
+ordinary bare allow. The combined verdict may discard an allow reason.
 
 ### Admission, cancellation, and shutdown
 
@@ -75,12 +75,28 @@ The adapter does not put overflow evaluations into the executor queue.
 
 | Setting | Behavior at capacity |
 | --- | --- |
-| `on_saturation="reject"` (default) | Immediate deny, `acs_async_capacity_exceeded`. |
-| `on_saturation="wait"` | Wait up to `admission_timeout` (default 0.1 seconds), then deny `acs_async_admission_timeout`. |
+| `on_saturation=Saturation.REJECT` (default) | Immediate deny, `acs_async_capacity_exceeded`. |
+| `on_saturation=Saturation.WAIT` | Wait up to `admission_timeout` (default 0.1 seconds), then deny `acs_async_admission_timeout`. |
 | Waiter count reaches `max_pending` (default 64) | Immediate deny, `acs_async_capacity_exceeded`. |
 
-All these denials are final (no approval). These are adapter reason
-codes, not new reserved ACS or Agent Hooks errors. Waiters are bounded,
+Import `Saturation` from `agent_control_spec`; the equivalent strings
+`"reject"` and `"wait"` are also accepted. The short default admission
+wait limits added queue latency. Increase it explicitly when waiting
+longer is preferable to rejecting; the emitter still caps the total.
+
+All these denials are final (no approval). The `acs_async_*` and
+`acs_point_unbound` reasons are diagnostic labels, not reserved or
+authenticated producer identifiers. A policy can return the same
+reason. A record reader must not infer adapter-versus-policy provenance
+from the reason alone. Both denials have the same enforcement effect;
+their internal origin is not an authorization input. This keeps the
+existing closed reserved-reason contract unchanged. Authenticating the
+origin would require a separately agreed, policy-unforgeable marker.
+
+The read-only `control.in_flight`, `control.waiting`, and
+`control.closed` properties expose current occupancy and whether closing
+has started. Read them on the adapter's event loop; `closed` can be true
+while active calls are draining. Waiters are bounded,
 but FIFO fairness is not promised. Configuration must use positive
 integer capacities and a finite positive admission timeout.
 
@@ -98,13 +114,28 @@ loop. An operation that never returns can prevent draining indefinitely.
 Do not create a replacement adapter per timeout: that would defeat the
 capacity bound. An adapter belongs to one event loop; cross-loop use
 raises an error.
+Closing the event loop first prevents completion callbacks from updating
+accounting and can leave the pool alive until the adapter is collected.
+There is no cross-loop recovery API; keep the owning loop alive until
+`aclose()` finishes.
 
 Context variables are copied to evaluation workers. Custom annotator,
 policy, and telemetry callbacks must be thread-safe. Unexpected worker
 exceptions are propagated to the awaiter and logged by exception type
 only, including after timeout; payloads and exception messages are not
-logged by the adapter. Engine failure verdicts retain their existing
-telemetry behavior.
+logged by the adapter. Context serialization happens before submission;
+serialization errors reach the caller/emitter without occupying a worker.
+
+Adapter denials and scope bypasses never enter the engine, so they
+produce Agent Hooks records but no engine telemetry events. An abandoned
+call can later emit an engine decision of `allow` even though the host
+already denied it on timeout or cancellation. That event describes the
+evaluation, not what the host enforced.
+
+A sink may receive one session's decision events out of lifecycle order.
+Engine telemetry has no session/sequence fields; use the Agent Hooks
+record trail and its sequence numbers to reconstruct order and determine
+what the host enforced.
 
 ### Operation deadlines
 
@@ -130,7 +161,8 @@ bound when arbitrary host callbacks are involved. Eight lifecycle
 points do not imply eight annotator calls: only each point's configured
 `annotations` request annotation work.
 
-The adapter can run as a source-supplied module over the released
+The adapter and its private `_evaluation` helper can run as source-supplied
+modules over the released
 `agent-control-spec==0.4.0a3` and `agent-hooks-sdk==0.1.0a5`; it is not
 itself included in that release. The activation options below require
 the new native build. Publishing the earlier GIL fix (#56) alone does

@@ -3,6 +3,7 @@
 """Activation carries resource caps and telemetry into async evaluation."""
 
 import asyncio
+from pathlib import Path
 
 import pytest
 from agent_control_spec import (
@@ -11,6 +12,15 @@ from agent_control_spec import (
     AsyncAcsInterceptor,
 )
 from agent_hooks import AgentContextBuilder, InterceptionEmitter
+from test_async_interceptor import (
+    BUNDLES,
+    GatedAnnotator,
+    entered,
+    until,
+)
+from test_async_interceptor import (
+    MANIFEST as ANNOTATOR_MANIFEST,
+)
 
 MANIFEST = """
 agent_control_specification_version: "0.4.0-alpha.1"
@@ -30,13 +40,19 @@ intervention_points:
 @pytest.fixture(params=["constructor", "activate", "from_memory"])
 def activate(request, tmp_path):
     path = tmp_path / "manifest.yaml"
-    path.write_text(MANIFEST)
-    if request.param == "from_memory":
-        return lambda **kwargs: ActivatedPolicy.from_memory(MANIFEST, {}, **kwargs)
-    factory = (
-        ActivatedPolicy if request.param == "constructor" else ActivatedPolicy.activate
-    )
-    return lambda **kwargs: factory(str(path), **kwargs)
+
+    def make(source=MANIFEST, **kwargs):
+        if request.param == "from_memory":
+            return ActivatedPolicy.from_memory(source, {}, **kwargs)
+        path.write_text(source)
+        factory = (
+            ActivatedPolicy
+            if request.param == "constructor"
+            else ActivatedPolicy.activate
+        )
+        return factory(str(path), **kwargs)
+
+    return make
 
 
 def context():
@@ -108,7 +124,10 @@ def test_loader_uses_host_manifest_limits(factory, tmp_path):
     parent.write_text(MANIFEST)
     child = tmp_path / "manifest.yaml"
     child.write_text(
-        'agent_control_specification_version: "0.4.0-alpha.1"\nextends: ["parent.yaml"]\n'
+        """
+agent_control_specification_version: "0.4.0-alpha.1"
+extends: ["parent.yaml"]
+"""
     )
     assert factory(str(child)).governs("input")
     with pytest.raises(ValueError, match="depth"):
@@ -128,3 +147,59 @@ def test_options_do_not_bypass_in_memory_bundle_validation():
             perf_telemetry="full",
             limits={"max_snapshot_bytes": 1024},
         )
+
+
+@pytest.mark.parametrize("custom_policy", [False, True])
+def test_activation_passes_url_limits_to_bundled_dispatchers(activate, custom_policy):
+    source = (
+        Path(__file__).resolve().parents[3] / "fixtures" / "pinned-prompt.yaml"
+    ).read_text()
+    options = (
+        {"policy_dispatcher": lambda invocation: {"decision": "allow"}}
+        if custom_policy
+        else {}
+    )
+    policy = activate(source, limits={"manifest_url_timeout_ms": 0}, **options)
+    verdict = policy.evaluate("input", context())
+    assert verdict.reason == "runtime_error:annotation_failed"
+    assert "timeout of 0 ms" in verdict.message
+
+    policy = activate(
+        source,
+        limits={"manifest_url_timeout_ms": 0},
+        annotator_dispatcher=lambda *args: {"label": "safe"},
+        **options,
+    )
+    assert policy.evaluate("input", context()).decision.value == "allow"
+
+
+def test_adapter_records_and_late_engine_telemetry_describe_different_outcomes():
+    async def run():
+        events = []
+        gate = GatedAnnotator()
+        policy = ActivatedPolicy.from_memory(
+            ANNOTATOR_MANIFEST,
+            BUNDLES,
+            annotator_dispatcher=gate,
+            telemetry_sink=events.append,
+        )
+        async with AsyncAcsInterceptor(policy, max_concurrency=1) as adapter:
+            emitter = InterceptionEmitter(timeout=0.1).register(adapter)
+            task = asyncio.create_task(emitter.emit_unchecked(context()))
+            try:
+                await entered(gate)
+                rejected = await emitter.emit_unchecked(context())
+                assert rejected.verdict.reason == "acs_async_capacity_exceeded"
+                assert events == []
+                timed_out = await task
+                assert timed_out.verdict.reason == "host_error:interceptor_timeout"
+                assert events == []
+            finally:
+                gate.release_all()
+            await until(lambda: adapter.in_flight == 0)
+            decisions = [e for e in events if e["event_type"] == "decision"]
+            assert len(decisions) == 1
+            assert decisions[0]["decision"] == "allow"
+            assert timed_out.verdict.decision.value == "deny"
+
+    asyncio.run(run())

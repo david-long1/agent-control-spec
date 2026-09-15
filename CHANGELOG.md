@@ -10,10 +10,15 @@
   lifecycle points outside this control without weakening bound-point
   failures or suppressing other controls. This is separate from the GIL
   fix below and does not change the manifest grammar.
+  Scope bypasses carry `acs_point_unbound` in per-interceptor records;
+  adapter reasons remain diagnostic labels, not reserved producer ids.
+  `Saturation` names the admission modes, and read-only `in_flight`,
+  `waiting`, and `closed` properties expose pool state. Admission
+  serializes an immutable snapshot once rather than deep-copying it.
 - All Python `ActivatedPolicy` constructors now accept `telemetry_sink`,
   `perf_telemetry`, and `limits`, preserving these settings through
   async evaluation. File activation applies host limits to manifest
-  loading as well. Existing calls keep their defaults.
+  loading and bundled dispatchers as well. Existing calls keep their defaults.
 - Regenerated the Python development lockfile from its requirements:
   it now installs the declared Agent Hooks `0.1.0a5` and maturin
   `1.15.0`, rather than the stale `0.1.0a3` / `1.8.7` pins.

@@ -6,15 +6,17 @@ from __future__ import annotations
 
 import asyncio
 import contextvars
-import copy
+import json
 import logging
 import math
 from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
 from enum import Enum
-from typing import TYPE_CHECKING, Any, Literal, Self
+from typing import TYPE_CHECKING, Any, Self
 
-from agent_hooks import InterceptionPoint, Verdict
+from agent_hooks import Decision, InterceptionPoint, Verdict
+
+from agent_control_spec._evaluation import evaluate_wire
 
 if TYPE_CHECKING:
     from agent_control_spec import ActivatedPolicy
@@ -29,6 +31,13 @@ class Scope(str, Enum):
     BOUND_POINTS_ONLY = "bound_points_only"
 
 
+class Saturation(str, Enum):
+    """Admission policy when all evaluation workers are occupied."""
+
+    REJECT = "reject"
+    WAIT = "wait"
+
+
 class AsyncAcsInterceptor:
     """An awaitable interceptor with a dedicated, bounded evaluation pool.
 
@@ -36,10 +45,11 @@ class AsyncAcsInterceptor:
     this adapter to one event loop; sharing it across loops is an error.
     Custom dispatchers and telemetry sinks must support concurrent threads.
 
-    ``on_saturation="reject"`` denies immediately when all workers are busy.
-    ``"wait"`` admits at most ``max_pending`` waiters, each for at most
-    ``admission_timeout`` seconds. The emitter's timeout includes admission.
-    Neither mode submits an unbounded executor backlog.
+    ``Saturation.REJECT`` denies immediately when all workers are busy.
+    ``Saturation.WAIT`` admits at most ``max_pending`` waiters, each for at
+    most ``admission_timeout`` seconds. The default 0.1-second wait limits
+    added queue latency; increase it explicitly for a host willing to wait
+    longer. The emitter's timeout still caps admission plus evaluation.
 
     Timeout/cancellation stops waiting, not evaluation. Capacity stays
     occupied until the native call returns. Configure finite operation
@@ -52,9 +62,9 @@ class AsyncAcsInterceptor:
         policy: ActivatedPolicy,
         name: str = "acs",
         *,
-        scope: Scope = Scope.STRICT,
+        scope: Scope | str = Scope.STRICT,
         max_concurrency: int = 8,
-        on_saturation: Literal["reject", "wait"] = "reject",
+        on_saturation: Saturation | str = Saturation.REJECT,
         max_pending: int = 64,
         admission_timeout: float = 0.1,
     ) -> None:
@@ -64,8 +74,6 @@ class AsyncAcsInterceptor:
         ):
             if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
                 raise ValueError(f"{key} must be a positive integer")
-        if on_saturation not in ("reject", "wait"):
-            raise ValueError("on_saturation must be 'reject' or 'wait'")
         if (
             isinstance(admission_timeout, bool)
             or not isinstance(admission_timeout, (int, float))
@@ -78,7 +86,7 @@ class AsyncAcsInterceptor:
         self._points = frozenset(policy.intervention_points)
         self._name = name
         self._max_concurrency = max_concurrency
-        self._on_saturation = on_saturation
+        self._on_saturation = Saturation(on_saturation)
         self._max_pending = max_pending
         self._admission_timeout = admission_timeout
         self._executor = ThreadPoolExecutor(
@@ -95,6 +103,21 @@ class AsyncAcsInterceptor:
     def name(self) -> str:
         """Payload-free registration name; pass it to ``emitter.register``."""
         return self._name
+
+    @property
+    def in_flight(self) -> int:
+        """Submitted evaluations not yet accounted as complete on the loop."""
+        return len(self._in_flight)
+
+    @property
+    def waiting(self) -> int:
+        """Calls waiting for admission, excluding submitted evaluations."""
+        return self._waiting
+
+    @property
+    def closed(self) -> bool:
+        """Whether closing has started; active evaluations may still be draining."""
+        return self._closed
 
     def _bind_loop(self) -> asyncio.AbstractEventLoop:
         loop = asyncio.get_running_loop()
@@ -114,9 +137,12 @@ class AsyncAcsInterceptor:
         if self._closed:
             return Verdict.deny(reason="acs_async_closed")
         if self._scope is Scope.BOUND_POINTS_ONLY and point not in self._points:
-            return Verdict.allow()
+            return Verdict(decision=Decision.ALLOW, reason="acs_point_unbound")
         if len(self._in_flight) >= self._max_concurrency:
-            if self._on_saturation == "reject" or self._waiting >= self._max_pending:
+            if (
+                self._on_saturation is Saturation.REJECT
+                or self._waiting >= self._max_pending
+            ):
                 return Verdict.deny(reason="acs_async_capacity_exceeded")
             self._waiting += 1
             try:
@@ -133,11 +159,12 @@ class AsyncAcsInterceptor:
                 self._waiting -= 1
         if self._closed:
             return Verdict.deny(reason="acs_async_closed")
-        snapshot = copy.deepcopy(context)
+        snapshot = json.dumps(context, allow_nan=False)
         work = loop.run_in_executor(
             self._executor,
             contextvars.copy_context().run,
-            self._policy.evaluate,
+            evaluate_wire,
+            self._policy._handle,
             point,
             snapshot,
         )

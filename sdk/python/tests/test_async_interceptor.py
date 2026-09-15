@@ -4,13 +4,14 @@
 
 import asyncio
 import contextvars
+import json
 import threading
 from contextlib import asynccontextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
-from agent_control_spec import ActivatedPolicy
-from agent_control_spec.async_interceptor import AsyncAcsInterceptor, Scope
+from agent_control_spec import ActivatedPolicy, _evaluation
+from agent_control_spec.async_interceptor import AsyncAcsInterceptor, Saturation, Scope
 from agent_hooks import (
     AgentContextBuilder,
     InterceptionBlocked,
@@ -163,7 +164,7 @@ def test_timeout_or_cancellation_does_not_release_worker_capacity(cancel):
             assert record.verdict.reason == "acs_async_capacity_exceeded"
             assert gate.calls == 1
             gate.gates[0].set()
-            await until(lambda: not adapter._in_flight)
+            await until(lambda: adapter.in_flight == 0)
             gate.gates[1].set()
             assert (
                 await emitter.emit(builder().input(content="third"))
@@ -189,7 +190,7 @@ def test_worker_and_waiter_bounds_and_completion_driven_admission():
             waiting = asyncio.create_task(
                 emitter.emit(builder().input(content="waiting"))
             )
-            await until(lambda: adapter._waiting == 1)
+            await until(lambda: adapter.waiting == 1)
             overflow = await emitter.emit_unchecked(builder().input(content="overflow"))
             assert overflow.verdict.reason == "acs_async_capacity_exceeded"
             assert gate.calls == 2
@@ -222,19 +223,19 @@ def test_waiter_deadline_or_cancellation_does_not_submit_or_leak(cancel):
             waiting = asyncio.create_task(
                 emitter.emit_unchecked(builder().input(content="waiting"))
             )
-            await until(lambda: adapter._waiting == 1)
+            await until(lambda: adapter.waiting == 1)
             if cancel:
                 waiting.cancel()
                 with pytest.raises(asyncio.CancelledError):
                     await waiting
             else:
                 assert (await waiting).verdict.reason == "acs_async_admission_timeout"
-            assert adapter._waiting == 0
+            assert adapter.waiting == 0
             assert gate.calls == 1
             replacement = asyncio.create_task(
                 emitter.emit(builder().input(content="replacement"))
             )
-            await until(lambda: adapter._waiting == 1)
+            await until(lambda: adapter.waiting == 1)
             gate.release_all()
             await asyncio.gather(running, replacement)
             assert gate.calls == 2
@@ -257,9 +258,11 @@ def test_close_rejects_pending_and_new_work_and_drains_after_cancellation():
             waiting = asyncio.create_task(
                 emitter.emit_unchecked(builder().input(content="waiting"))
             )
-            await until(lambda: adapter._waiting == 1)
+            await until(lambda: adapter.waiting == 1)
             closing = asyncio.create_task(adapter.aclose())
             assert (await waiting).verdict.reason == "acs_async_closed"
+            assert adapter.closed
+            assert adapter.in_flight == 1
             assert not closing.done()
             closing.cancel()
             with pytest.raises(asyncio.CancelledError):
@@ -272,7 +275,7 @@ def test_close_rejects_pending_and_new_work_and_drains_after_cancellation():
             await running
             await adapter.aclose()
             await adapter.aclose()
-            assert not adapter._in_flight
+            assert adapter.in_flight == 0
 
     asyncio.run(run())
 
@@ -291,6 +294,8 @@ def test_scoping_preserves_bound_denial_and_other_controls(scope):
                 )
             else:
                 assert result.verdict.decision.value == "allow"
+                assert result.verdicts[0].reason == "acs_point_unbound"
+                assert result.verdict.reason is None
             with pytest.raises(InterceptionBlocked) as blocked:
                 await emitter.emit(
                     builder().pre_tool_call(call_id="t1", name="search", args={})
@@ -419,7 +424,7 @@ def test_emitter_timeout_covers_admission_without_submitting():
             assert (
                 blocked.value.result.verdict.reason == "host_error:interceptor_timeout"
             )
-            assert adapter._waiting == 0
+            assert adapter.waiting == 0
             assert gate.calls == 1
             gate.release_all()
             await running
@@ -460,19 +465,20 @@ def test_submission_failure_is_visible_and_does_not_leak_capacity(monkeypatch):
                 patch.setattr(adapter._executor, "submit", broken_submit)
                 record = await emitter.emit_unchecked(builder().input(content="x"))
                 assert record.verdict.reason == "host_error:interceptor_failed"
-            assert not adapter._in_flight
+            assert adapter.in_flight == 0
             record = await emitter.emit_unchecked(builder().input(content="x"))
             assert record.verdict.reason == "runtime_error:intervention_point_unknown"
 
     asyncio.run(run())
 
 
-def test_boundary_error_releases_capacity_and_remains_fail_closed(caplog):
+def test_boundary_error_never_submits_and_remains_fail_closed():
     async def run():
         async with gated_adapter(max_concurrency=1) as (gate, adapter):
             with pytest.raises(ValueError):
                 await adapter.intercept(builder().input(content=float("nan")))
-            assert not adapter._in_flight
+            assert adapter.in_flight == 0
+            assert gate.calls == 0
             gate.gates[0].set()
             await (
                 InterceptionEmitter()
@@ -481,7 +487,6 @@ def test_boundary_error_releases_capacity_and_remains_fail_closed(caplog):
             )
 
     asyncio.run(run())
-    assert "ACS async evaluation raised ValueError" in caplog.text
 
 
 def test_builtin_operation_deadline_returns_native_timeout_without_emitter_timeout():
@@ -521,7 +526,7 @@ def test_builtin_operation_deadline_returns_native_timeout_without_emitter_timeo
                 assert requested.is_set()
                 assert not release.is_set()
                 assert record.verdict.reason == "runtime_error:annotation_timeout"
-                assert not adapter._in_flight
+                assert adapter.in_flight == 0
 
         asyncio.run(run())
     finally:
@@ -529,3 +534,98 @@ def test_builtin_operation_deadline_returns_native_timeout_without_emitter_timeo
         server.shutdown()
         server.server_close()
         thread.join(timeout=5)
+
+
+@pytest.mark.parametrize("mode", [Saturation.REJECT, Saturation.WAIT, "reject", "wait"])
+def test_saturation_enum_and_string_forms_and_readonly_counters(mode):
+    async def run():
+        policy = ActivatedPolicy.from_memory(TOOL_MANIFEST, {})
+        adapter = AsyncAcsInterceptor(policy, on_saturation=mode)
+        assert adapter.in_flight == adapter.waiting == 0
+        assert not adapter.closed
+        for name in ("in_flight", "waiting", "closed"):
+            with pytest.raises(AttributeError):
+                setattr(adapter, name, 1)
+        await adapter.aclose()
+        assert adapter.closed
+
+    asyncio.run(run())
+
+
+def test_snapshot_is_serialized_once_without_deepcopy(monkeypatch):
+    class Context(dict):
+        def __deepcopy__(self, memo):
+            raise AssertionError("the adapter must not deep-copy the context")
+
+    async def run():
+        entered_native = asyncio.Event()
+        release = threading.Event()
+        loop = asyncio.get_running_loop()
+        original = _evaluation._native.policy_evaluate
+        wires = []
+
+        def evaluate(handle, point, wire):
+            wires.append(wire)
+            loop.call_soon_threadsafe(entered_native.set)
+            assert release.wait(5)
+            return original(handle, point, wire)
+
+        policy = ActivatedPolicy.from_memory(
+            MANIFEST,
+            BUNDLES,
+            annotator_dispatcher=lambda name, definition, prelim: {
+                "completed": prelim["policy_target"]["value"]["content"] == "before"
+            },
+        )
+        async with AsyncAcsInterceptor(policy) as adapter:
+            monkeypatch.setattr(_evaluation._native, "policy_evaluate", evaluate)
+            context = Context(builder().input(content="before"))
+            task = asyncio.create_task(adapter.intercept(context))
+            try:
+                await asyncio.wait_for(entered_native.wait(), 3)
+                context["input"]["content"] = "after"
+                assert adapter.in_flight == 1
+            finally:
+                release.set()
+            assert (await task).decision.value == "allow"
+            assert len(wires) == 1
+            assert json.loads(wires[0])["input"]["content"] == "before"
+
+    asyncio.run(run())
+
+
+def test_late_worker_exception_is_reported_without_payload(monkeypatch, caplog):
+    async def run():
+        entered_native = asyncio.Event()
+        release = threading.Event()
+        loop = asyncio.get_running_loop()
+
+        def broken(*args):
+            loop.call_soon_threadsafe(entered_native.set)
+            assert release.wait(5)
+            raise RuntimeError("private payload")
+
+        policy = ActivatedPolicy.from_memory(TOOL_MANIFEST, {})
+        async with AsyncAcsInterceptor(policy, max_concurrency=1) as adapter:
+            monkeypatch.setattr(_evaluation._native, "policy_evaluate", broken)
+            task = asyncio.create_task(
+                InterceptionEmitter(timeout=0.1)
+                .register(adapter)
+                .emit(builder().input(content="x"))
+            )
+            try:
+                await asyncio.wait_for(entered_native.wait(), 3)
+                with pytest.raises(InterceptionBlocked) as blocked:
+                    await task
+                assert (
+                    blocked.value.result.verdict.reason
+                    == "host_error:interceptor_timeout"
+                )
+                assert adapter.in_flight == 1
+            finally:
+                release.set()
+            await until(lambda: adapter.in_flight == 0)
+
+    asyncio.run(run())
+    assert "ACS async evaluation raised RuntimeError" in caplog.text
+    assert "private payload" not in caplog.text
