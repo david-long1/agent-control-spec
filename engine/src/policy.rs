@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::Path;
 
-const DATA_PATH_KEYS: [&str; 2] = ["data", "data_paths"];
+pub(crate) const DATA_PATH_KEYS: [&str; 2] = ["data", "data_paths"];
 
 fn resolve_relative_string(value: &str, base_dir: &Path) -> Option<String> {
     if value.is_empty() {
@@ -121,6 +121,209 @@ impl PolicyBinding {
     }
 }
 
+// Gates for a policy declared in a fetched document. A fetched document
+// has no directory to resolve a relative path against, and an absolute
+// path is a host file the remote author picked, so both are refused.
+// `document` names the fetched document (the loader passes
+// `remote manifest '<url>'`, the host mark its own marker) and `context`
+// the policy or binding, so the error says where the field came from.
+impl PolicyConfig {
+    pub(crate) fn reject_filesystem_path_fields(
+        &self,
+        document: &str,
+        context: &str,
+    ) -> Result<(), RuntimeError> {
+        match self {
+            Self::Rego(config) => {
+                if config.bundle.is_some() {
+                    return Err(filesystem_field_error(
+                        document,
+                        context,
+                        "bundle",
+                        "in-memory modules through set_rego_bundle_in_memory, a host supplied \
+                         policy dispatcher, or a policy declared in a file under the manifest \
+                         root",
+                    ));
+                }
+                reject_adapter_data_paths(document, context, &config.adapter_config)
+            }
+            Self::Cedar(config) => {
+                for (field, value) in [
+                    ("policy_path", &config.policy_path),
+                    ("entities_path", &config.entities_path),
+                    ("schema_path", &config.schema_path),
+                ] {
+                    if value.is_some() {
+                        return Err(filesystem_field_error(
+                            document,
+                            context,
+                            field,
+                            "inline policy_set",
+                        ));
+                    }
+                }
+                Ok(())
+            }
+            Self::Test(config) => {
+                reject_adapter_data_paths(document, context, &config.adapter_config)
+            }
+            Self::Custom(config) => {
+                reject_adapter_data_paths(document, context, &config.adapter_config)
+            }
+        }
+    }
+
+    pub(crate) fn reject_remote_bundle_field(
+        &self,
+        document: &str,
+        context: &str,
+    ) -> Result<(), RuntimeError> {
+        match self {
+            Self::Rego(config) => {
+                reject_remote_bundle_key(document, context, &config.adapter_config)
+            }
+            Self::Test(config) => {
+                reject_remote_bundle_key(document, context, &config.adapter_config)
+            }
+            Self::Custom(config) => {
+                reject_remote_bundle_key(document, context, &config.adapter_config)
+            }
+            // Cedar rejects unknown fields at parse time.
+            Self::Cedar(_) => Ok(()),
+        }
+    }
+
+    pub(crate) fn reject_non_rule_query(
+        &self,
+        document: &str,
+        context: &str,
+    ) -> Result<(), RuntimeError> {
+        match self {
+            Self::Rego(config) => match config.query.as_deref() {
+                Some(query) => reject_non_rule_query_text(document, context, query),
+                None => Ok(()),
+            },
+            // A cedar `query` is a request template object, not code.
+            _ => Ok(()),
+        }
+    }
+}
+
+impl PolicyBinding {
+    pub(crate) fn reject_filesystem_path_fields(
+        &self,
+        document: &str,
+        context: &str,
+    ) -> Result<(), RuntimeError> {
+        reject_adapter_data_paths(document, context, &self.adapter_config)
+    }
+
+    pub(crate) fn reject_remote_bundle_field(
+        &self,
+        document: &str,
+        context: &str,
+    ) -> Result<(), RuntimeError> {
+        reject_remote_bundle_key(document, context, &self.adapter_config)
+    }
+
+    pub(crate) fn reject_non_rule_query(
+        &self,
+        document: &str,
+        context: &str,
+    ) -> Result<(), RuntimeError> {
+        match self.query.as_deref() {
+            Some(query) => reject_non_rule_query_text(document, context, query),
+            None => Ok(()),
+        }
+    }
+}
+
+fn reject_adapter_data_paths(
+    document: &str,
+    context: &str,
+    adapter_config: &BTreeMap<String, JsonValue>,
+) -> Result<(), RuntimeError> {
+    for key in DATA_PATH_KEYS {
+        if adapter_config.contains_key(key) {
+            return Err(filesystem_field_error(
+                document,
+                context,
+                key,
+                "a policy declared in a file under the manifest root",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn filesystem_field_error(
+    document: &str,
+    context: &str,
+    field: &str,
+    alternative: &str,
+) -> RuntimeError {
+    RuntimeError::ManifestInvalid(format!(
+        "{document}: {context} declares filesystem path field '{field}'; a {} cannot reference \
+         host files, use {alternative} instead",
+        crate::constants::provenance::MARKER
+    ))
+}
+
+fn reject_remote_bundle_key(
+    document: &str,
+    context: &str,
+    adapter_config: &BTreeMap<String, JsonValue>,
+) -> Result<(), RuntimeError> {
+    let key = crate::constants::remote_bundle::BUNDLE_URL;
+    if adapter_config.contains_key(key) {
+        return Err(RuntimeError::ManifestInvalid(format!(
+            "{document}: {context} declares a remote rego '{key}' on an unpinned path; a {} may \
+             name one only when every URL extends from the root manifest to this document is \
+             pinned with sha256 or integrity, and a document the host marked carries no pin",
+            crate::constants::provenance::MARKER
+        )));
+    }
+    Ok(())
+}
+
+fn reject_non_rule_query_text(
+    document: &str,
+    context: &str,
+    query: &str,
+) -> Result<(), RuntimeError> {
+    if is_rule_path(query) {
+        return Ok(());
+    }
+    Err(RuntimeError::ManifestInvalid(format!(
+        "{document}: {context} declares rego query '{query}' that is not a plain rule path; a {} \
+         may only name a rule such as data.acs.decision, because an expression query runs as \
+         code inside the policy engine",
+        crate::constants::provenance::MARKER
+    )))
+}
+
+/// Whether `query` is a plain rule path such as
+/// `data.agent_control_specification.input.verdict`, as opposed to an
+/// expression like `count(numbers.range(1, 5))`.
+///
+/// Deliberately conservative: anything with whitespace, an operator, a
+/// call, or a subscript is not a rule path. The Rego dispatcher uses this
+/// to pick the cheaper `eval_rule`, where guessing wrong would change a
+/// verdict; the fetched document gate uses it to keep remote queries to
+/// names, which cannot call a builtin.
+pub(crate) fn is_rule_path(query: &str) -> bool {
+    let Some(rest) = query.strip_prefix("data.") else {
+        return false;
+    };
+    !rest.is_empty()
+        && rest.split('.').all(|segment| {
+            !segment.is_empty()
+                && segment
+                    .chars()
+                    .all(|character| character.is_ascii_alphanumeric() || character == '_')
+        })
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RegoPolicyConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -135,6 +338,34 @@ pub struct RegoPolicyConfig {
     pub inline_bundle: Option<std::sync::Arc<InMemoryRegoBundle>>,
     #[serde(default, flatten, skip_serializing_if = "BTreeMap::is_empty")]
     pub adapter_config: BTreeMap<String, JsonValue>,
+}
+
+impl RegoPolicyConfig {
+    /// Validates mutually exclusive policy sources without adding fields to the
+    /// public struct-literal API. `bundle_url` lives in the flattened adapter map.
+    pub fn bundle_url(&self) -> Result<Option<crate::manifest::PinnedHttpsSource>, RuntimeError> {
+        rego_bundle_url(
+            self.bundle.as_deref(),
+            self.inline_bundle.is_some(),
+            &self.adapter_config,
+        )
+    }
+}
+
+fn rego_bundle_url(
+    bundle: Option<&str>,
+    inline: bool,
+    adapter: &BTreeMap<String, JsonValue>,
+) -> Result<Option<crate::manifest::PinnedHttpsSource>, RuntimeError> {
+    let remote = adapter.get("bundle_url");
+    if usize::from(bundle.is_some()) + usize::from(inline) + usize::from(remote.is_some()) > 1 {
+        return Err(RuntimeError::ManifestInvalid(
+            "Rego policy must not combine bundle, inline_bundle, and bundle_url".to_string(),
+        ));
+    }
+    remote
+        .map(crate::manifest::PinnedHttpsSource::from_value)
+        .transpose()
 }
 
 /// AGT D3.1 Cedar policy definition. Either `policy_set` (inline Cedar text)
@@ -391,6 +622,17 @@ pub struct RegoPolicyInvocation {
     pub canonical_input: String,
 }
 
+impl RegoPolicyInvocation {
+    pub fn bundle_url(&self) -> Result<Option<crate::manifest::PinnedHttpsSource>, RuntimeError> {
+        rego_bundle_url(
+            self.bundle.as_deref(),
+            self.inline_bundle.is_some(),
+            &self.adapter_config,
+        )
+        .map_err(|err| RuntimeError::PolicyInvocationFailed(err.detail().to_string()))
+    }
+}
+
 /// AGT D3 prepared cedar invocation. Carries the resolved cedar policy
 /// source (inline `policy_set` text or a `policy_path` location), the
 /// optional `entities_path` / `schema_path` artefacts, the optional
@@ -436,6 +678,7 @@ pub fn validate_policy_definition(name: &str, config: &PolicyConfig) -> Result<(
         PolicyConfig::Rego(config) => {
             validate_optional_string("rego.query", config.query.as_deref())?;
             validate_optional_string("rego.bundle", config.bundle.as_deref())?;
+            config.bundle_url()?;
             for field in cedar_field::ALL {
                 if config.adapter_config.contains_key(field) {
                     return Err(RuntimeError::ManifestInvalid(format!(
@@ -497,12 +740,18 @@ pub fn validate_policy_binding(
             error.detail()
         ))
     })?;
-    if matches!(config, PolicyConfig::Rego(_)) {
-        let top_level_query = match config {
-            PolicyConfig::Rego(config) => config.query.as_deref(),
-            _ => None,
-        };
-        if binding.query.as_deref().or(top_level_query).is_none() {
+    if let PolicyConfig::Rego(config) = config {
+        rego_bundle_url(
+            config.bundle.as_deref(),
+            config.inline_bundle.is_some(),
+            &merge_adapter_config(&config.adapter_config, &binding.adapter_config),
+        )?;
+        if binding
+            .query
+            .as_deref()
+            .or(config.query.as_deref())
+            .is_none()
+        {
             return Err(RuntimeError::ManifestInvalid(format!(
                 "rego policy for intervention point {} requires policy.query",
                 intervention_point
@@ -518,22 +767,29 @@ pub fn prepare_policy_invocation(
     final_policy_input: &JsonValue,
 ) -> Result<PreparedPolicyInvocation, RuntimeError> {
     match config {
-        PolicyConfig::Rego(config) => Ok(PreparedPolicyInvocation::Rego(RegoPolicyInvocation {
-            query: binding
-                .query
-                .clone()
-                .or_else(|| config.query.clone())
-                .ok_or_else(|| {
-                    RuntimeError::PolicyInvocationFailed(
-                        "rego policy invocation requires a query".to_string(),
-                    )
-                })?,
-            bundle: config.bundle.clone(),
-            inline_bundle: config.inline_bundle.clone(),
-            adapter_config: merge_adapter_config(&config.adapter_config, &binding.adapter_config),
-            input: final_policy_input.clone(),
-            canonical_input: canonical_policy_input(final_policy_input)?,
-        })),
+        PolicyConfig::Rego(config) => {
+            let invocation = RegoPolicyInvocation {
+                query: binding
+                    .query
+                    .clone()
+                    .or_else(|| config.query.clone())
+                    .ok_or_else(|| {
+                        RuntimeError::PolicyInvocationFailed(
+                            "rego policy invocation requires a query".to_string(),
+                        )
+                    })?,
+                bundle: config.bundle.clone(),
+                inline_bundle: config.inline_bundle.clone(),
+                adapter_config: merge_adapter_config(
+                    &config.adapter_config,
+                    &binding.adapter_config,
+                ),
+                input: final_policy_input.clone(),
+                canonical_input: canonical_policy_input(final_policy_input)?,
+            };
+            invocation.bundle_url()?;
+            Ok(PreparedPolicyInvocation::Rego(invocation))
+        }
         PolicyConfig::Cedar(config) => Ok(PreparedPolicyInvocation::Cedar(CedarPolicyInvocation {
             policy_set: config.policy_set.clone(),
             policy_path: config.policy_path.clone(),

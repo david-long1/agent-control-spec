@@ -7,6 +7,7 @@ export declare class ExternalObject<T> {
     [K: symbol]: T
   }
 }
+
 /**
  * The engine's default resource caps as a JSON object string. A host
  * that raises one cap reads this to see what it is overriding, so a

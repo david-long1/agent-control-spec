@@ -18,7 +18,9 @@
 // problems only (bad UTF-8, non-object context, poisoned handle).
 
 use agent_control_spec::annotation::{AnnotatorDispatcher, AnnotatorInvocation};
-use agent_control_spec::dispatchers::{default_annotator_dispatcher, BindingPolicyDispatcher};
+use agent_control_spec::dispatchers::{
+    default_annotator_dispatcher, default_annotator_dispatcher_with_limits, BindingPolicyDispatcher,
+};
 use agent_control_spec::policy::PreparedPolicyInvocation;
 use agent_control_spec::runtime::PolicyDispatcher;
 use agent_control_spec::stream_session::{
@@ -1100,7 +1102,7 @@ pub unsafe extern "C" fn acs_interceptor_new_with_hooks(
                 },
                 call,
             }),
-            None => default_annotator_dispatcher(),
+            None => default_annotator_dispatcher_with_limits(limits),
         };
         let policy: Arc<dyn PolicyDispatcher> = match policy_fn {
             Some(call) => Arc::new(HostPolicyDispatcher {
@@ -1110,7 +1112,7 @@ pub unsafe extern "C" fn acs_interceptor_new_with_hooks(
                 },
                 call,
             }),
-            None => Arc::new(BindingPolicyDispatcher::new()),
+            None => Arc::new(BindingPolicyDispatcher::with_limits(limits)),
         };
         let telemetry: Arc<dyn TelemetrySink> = match telemetry_fn {
             Some(call) => Arc::new(HostTelemetrySink {
@@ -2110,6 +2112,84 @@ intervention_points:
         .to_string()
     }
 
+    #[test]
+    fn hook_constructor_passes_url_limits_to_default_annotators_only() {
+        unsafe extern "C" fn annotate(
+            ctx: *mut c_void,
+            _name: *const c_char,
+            _invocation: *const c_char,
+            _input: *const c_char,
+            _error: *mut *mut c_char,
+        ) -> *mut c_char {
+            *(ctx as *mut usize) += 1;
+            CString::new(r#"{"label":"safe"}"#).unwrap().into_raw()
+        }
+        unsafe extern "C" fn policy(
+            ctx: *mut c_void,
+            _invocation: *const c_char,
+            _error: *mut *mut c_char,
+        ) -> *mut c_char {
+            *(ctx as *mut usize) += 1;
+            CString::new(r#"{"decision":"allow"}"#).unwrap().into_raw()
+        }
+        unsafe extern "C" fn free(_ctx: *mut c_void, value: *mut c_char) {
+            drop(CString::from_raw(value));
+        }
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("fixtures")
+            .join("pinned-prompt.yaml");
+        let path = path.to_str().unwrap().as_bytes();
+        let limits = CString::new(r#"{"manifest_url_timeout_ms":0}"#).unwrap();
+        for (custom_annotator, custom_policy) in
+            [(false, false), (false, true), (true, false), (true, true)]
+        {
+            let mut annotator_calls = 0_usize;
+            let mut policy_calls = 0_usize;
+            let mut err = std::ptr::null_mut();
+            let handle = unsafe {
+                acs_interceptor_new_with_hooks(
+                    path.as_ptr(),
+                    path.len(),
+                    if custom_annotator {
+                        Some(annotate)
+                    } else {
+                        None
+                    },
+                    (&mut annotator_calls as *mut usize).cast(),
+                    if custom_policy { Some(policy) } else { None },
+                    (&mut policy_calls as *mut usize).cast(),
+                    None,
+                    std::ptr::null_mut(),
+                    Some(free),
+                    std::ptr::null(),
+                    limits.as_ptr(),
+                    &mut err,
+                )
+            };
+            assert!(err.is_null(), "constructor failed");
+            assert!(!handle.is_null());
+            let verdict = intercept(
+                handle,
+                r#"{"interception_point":"input","input":{"content":"hello","role":"user"}}"#,
+            );
+            unsafe { acs_interceptor_free(handle) };
+            assert_eq!(annotator_calls, usize::from(custom_annotator));
+            assert_eq!(policy_calls, usize::from(custom_annotator && custom_policy));
+            if custom_annotator {
+                assert_eq!(verdict["decision"], "allow");
+            } else {
+                assert_eq!(verdict["decision"], "deny");
+                assert_eq!(verdict["reason"], "runtime_error:annotation_failed");
+                assert!(verdict["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("timeout of 0 ms"));
+            }
+        }
+    }
+
     fn validate(bytes: &[u8]) -> (i32, Option<String>) {
         let mut err: *mut c_char = std::ptr::null_mut();
         let code = unsafe { acs_validate_manifest(bytes.as_ptr(), bytes.len(), &mut err) };
@@ -2421,6 +2501,85 @@ intervention_points:
 
     /// Malformed JSON is a boundary error, not a policy that quietly
     /// activates without the modules the host meant to supply.
+    static LAST_INVOCATION: Mutex<Option<String>> = Mutex::new(None);
+
+    unsafe extern "C" fn recording_annotator(
+        _ctx: *mut c_void,
+        _annotator_name: *const c_char,
+        invocation_json: *const c_char,
+        _policy_input_json: *const c_char,
+        _err_out: *mut *mut c_char,
+    ) -> *mut c_char {
+        let invocation = CStr::from_ptr(invocation_json).to_str().unwrap().to_owned();
+        *LAST_INVOCATION.lock().unwrap() = Some(invocation);
+        CString::new(r#"{"label":"safe"}"#).unwrap().into_raw()
+    }
+
+    unsafe extern "C" fn free_hook_string(_ctx: *mut c_void, value: *mut c_char) {
+        if !value.is_null() {
+            drop(CString::from_raw(value));
+        }
+    }
+
+    /// Manifest provenance stays inside the engine. A local manifest may
+    /// name a host environment variable, and a host dispatcher receives
+    /// the invocation the manifest wrote, with no provenance key added.
+    #[test]
+    fn local_manifest_naming_api_key_env_constructs_without_a_provenance_key() {
+        let dir = std::env::temp_dir().join(format!("acs-ffi-env-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("llm-env-manifest.yaml");
+        std::fs::write(
+            &path,
+            concat!(
+                "agent_control_specification_version: \"0.4.0-alpha.1\"\n",
+                "policies:\n  allow:\n    type: test\n    verdict:\n      decision: allow\n",
+                "annotators:\n  judge:\n    type: llm\n    api_key_env: ACS_FFI_LOCAL_TEST_KEY\n",
+                "intervention_points:\n  input:\n    policy_target: \"$.input\"\n",
+                "    policy:\n      id: allow\n",
+                "    annotations:\n      judge:\n        from: \"$target\"\n"
+            ),
+        )
+        .unwrap();
+        let path = path.to_str().unwrap().as_bytes();
+
+        let mut err: *mut c_char = std::ptr::null_mut();
+        let handle = unsafe {
+            acs_interceptor_new_with_hooks(
+                path.as_ptr(),
+                path.len(),
+                Some(recording_annotator),
+                std::ptr::null_mut(),
+                None,
+                std::ptr::null_mut(),
+                None,
+                std::ptr::null_mut(),
+                Some(free_hook_string),
+                std::ptr::null(),
+                std::ptr::null(),
+                &mut err,
+            )
+        };
+        if !err.is_null() {
+            let msg = unsafe { CStr::from_ptr(err) }.to_str().unwrap().to_owned();
+            unsafe { acs_free_string(err) };
+            panic!("constructor failed: {msg}");
+        }
+        assert!(!handle.is_null());
+
+        let verdict = intercept(
+            handle,
+            r#"{"interception_point":"input","input":{"content":"hi","role":"user"}}"#,
+        );
+        unsafe { acs_interceptor_free(handle) };
+
+        assert_eq!(verdict["decision"], "allow");
+        let invocation: Value =
+            serde_json::from_str(LAST_INVOCATION.lock().unwrap().as_deref().unwrap()).unwrap();
+        assert_eq!(invocation["api_key_env"], "ACS_FFI_LOCAL_TEST_KEY");
+        assert!(invocation.get("url_sourced").is_none(), "{invocation}");
+    }
+
     #[test]
     fn activating_from_memory_rejects_malformed_bundles_json() {
         let manifest =
