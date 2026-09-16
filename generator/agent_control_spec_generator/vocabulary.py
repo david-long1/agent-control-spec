@@ -115,13 +115,21 @@ TARGET_SHAPES = {
 #: default `allow` answers, and the redaction silently does nothing.
 STRING_TARGET_POINTS = frozenset({"post_tool_call"})
 
+#: Points at which AGENT-HOOKS-0.1 section 4.3 forbids a transform. A host
+#: MUST reject one with `host_error:transform_target_forbidden`. The ACS
+#: engine does not reject it, because the obligation is the host's, so a
+#: generated transform rule at either point compiles and evaluates cleanly
+#: and then fails at the host boundary on every firing.
+TRANSFORM_FORBIDDEN_POINTS = frozenset({"agent_startup", "agent_shutdown"})
+
 #: The member carrying redactable text at each point whose `$target` is an
 #: object, used to name the right path in a repair diagnostic.
+#: `agent_startup` and `agent_shutdown` are absent because no transform may
+#: reach them, see `TRANSFORM_FORBIDDEN_POINTS`.
 TEXT_MEMBER_BY_POINT = {
     "input": "$target.content",
     "post_model_call": "$target.content",
     "output": "$target.content",
-    "agent_shutdown": "$target.reason",
 }
 
 #: The two points at which a tool is projected, ACS specification section 4.

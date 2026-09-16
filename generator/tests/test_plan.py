@@ -178,7 +178,6 @@ def test_replace_without_a_value_is_rejected():
         ("input", "$target.content"),
         ("output", "$target.content"),
         ("post_model_call", "$target.content"),
-        ("agent_shutdown", "$target.reason"),
     ],
 )
 def test_redaction_rooted_at_bare_target_is_rejected_where_it_can_never_fire(
@@ -204,6 +203,21 @@ def test_redaction_rooted_at_bare_target_is_allowed_where_the_target_is_a_string
         effects=[{"type": "redact", "path": "$target", "pattern": "acct_[0-9]+"}],
     )
     assert parse(plan).rules[0].effects[0]["path"] == "$target"
+
+
+@pytest.mark.parametrize("point", ["agent_startup", "agent_shutdown"])
+def test_a_transform_at_startup_or_shutdown_is_rejected(point: str):
+    """AGENT-HOOKS-0.1 section 4.3 forbids it and a host must reject it with
+    `host_error:transform_target_forbidden`. The ACS engine emits it happily,
+    because the obligation is the host's, so nothing downstream catches it."""
+    plan = _transform_plan(
+        point=point,
+        effects=[{"type": "replace", "path": "$target", "value": {}}],
+    )
+    with pytest.raises(PlanError) as excinfo:
+        parse(plan)
+    assert "AGENT-HOOKS-0.1 section 4.3" in str(excinfo.value)
+    assert "host_error:transform_target_forbidden" in str(excinfo.value)
 
 
 def test_tool_entries_accept_strings_and_objects():

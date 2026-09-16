@@ -24,6 +24,7 @@ from .vocabulary import (
     STRING_TARGET_POINTS,
     TARGET_SHAPES,
     TEXT_MEMBER_BY_POINT,
+    TRANSFORM_FORBIDDEN_POINTS,
 )
 
 
@@ -170,6 +171,15 @@ def _rule(item: Any) -> RulePlan:
     if not isinstance(effects, list):
         raise PlanError("rule effects must be a list")
     if decision == "transform":
+        if point in TRANSFORM_FORBIDDEN_POINTS:
+            raise PlanError(
+                f"a transform rule at '{point}' is forbidden by AGENT-HOOKS-0.1 "
+                "section 4.3, and a host must reject it with "
+                "host_error:transform_target_forbidden. The engine does not catch "
+                "this, because the obligation is the host's. Use deny, warn or "
+                "escalate at this point, or transform at a point that mediates a "
+                "value the action consumes"
+            )
         _validate_transform_effects(effects, point)
     conditions = item.get("conditions", [])
     if not isinstance(conditions, list):

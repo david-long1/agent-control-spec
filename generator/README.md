@@ -119,7 +119,10 @@ to. An unconditional blocking rule fires on every request at its point. A
 reason in the reserved `runtime_error:` namespace is rejected by the engine
 at evaluation. A redaction rooted at bare `$target` where the target is an
 object can never fire. A transform whose effects name two paths cannot
-compile faithfully, because a verdict carries one replacement.
+compile faithfully, because a verdict carries one replacement. A transform at
+`agent_startup` or `agent_shutdown` is forbidden by AGENT-HOOKS-0.1 section
+4.3, and the engine will not catch that one, because rejecting it is the
+host's obligation rather than the interceptor's.
 
 ## Python API
 

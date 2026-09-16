@@ -28,12 +28,14 @@ from .vocabulary import (
     INTERVENTION_POINT_NAMES,
     MAX_REPAIR_ATTEMPTS,
     TARGET_SHAPES,
+    TRANSFORM_FORBIDDEN_POINTS,
 )
 
 _TARGET_TABLE = "\n".join(
     f"- {point}: $target is {TARGET_SHAPES[point]}"
     for point in INTERVENTION_POINT_NAMES
 )
+_FORBIDDEN_TRANSFORM_POINTS = " or ".join(sorted(TRANSFORM_FORBIDDEN_POINTS))
 
 SYSTEM_PROMPT = f"""You author only a constrained JSON policy plan for Agent Control Specification artifacts.
 Return JSON only. Do not emit YAML. Do not emit Rego modules.
@@ -50,7 +52,7 @@ Rule conditions are Rego body lines. They may read only input.intervention_point
 input.policy_target.value is the value under control at the current point, and $target is the same value as a transform root. Its shape per point:
 {_TARGET_TABLE}
 
-To change the value under control, use decision "transform" with exactly one effect whose type is redact or replace and whose path begins with $target. allow, warn, deny and escalate must never carry effects. A redact effect needs a "pattern", which must be an RE2 regular expression, so no lookahead, no lookbehind and no backreferences. Point the path at the member holding the text, for example $target.content at input, post_model_call and output, because bare $target is an object at those points and a redaction rooted there can never fire. Never write $target.value, because the policy target already is the value.
+To change the value under control, use decision "transform" with exactly one effect whose type is redact or replace and whose path begins with $target. allow, warn, deny and escalate must never carry effects. A redact effect needs a "pattern", which must be an RE2 regular expression, so no lookahead, no lookbehind and no backreferences. Point the path at the member holding the text, for example $target.content at input, post_model_call and output, because bare $target is an object at those points and a redaction rooted there can never fire. Never write $target.value, because the policy target already is the value. Never use transform at {_FORBIDDEN_TRANSFORM_POINTS}, where a host is required to reject it.
 
 A reason must not begin with "runtime_error:", which is the engine's reserved namespace.
 
