@@ -37,7 +37,7 @@ def redaction_plan(pattern: str) -> dict:
                 "point": "output",
                 "decision": "transform",
                 "reason": "redact",
-                "conditions": ["true"],
+                "conditions": ['contains(input.policy_target.value.content, "acct")'],
                 "effects": [
                     {"type": "redact", "path": "$target.content", "pattern": pattern}
                 ],
@@ -145,7 +145,7 @@ def test_a_second_chained_pattern_is_checked_too():
                 "point": "output",
                 "decision": "transform",
                 "reason": "redact",
-                "conditions": ["true"],
+                "conditions": ['contains(input.policy_target.value.content, "acct")'],
                 "effects": [
                     {
                         "type": "redact",
@@ -179,7 +179,9 @@ def test_both_chained_patterns_reach_the_rendered_policy(tmp_path):
                             "point": "output",
                             "decision": "transform",
                             "reason": "redact",
-                            "conditions": ["true"],
+                            "conditions": [
+                                'contains(input.policy_target.value.content, "acct")'
+                            ],
                             "effects": [
                                 {
                                     "type": "redact",
@@ -308,3 +310,103 @@ def test_every_guarded_point_is_smoke_evaluated(
         "pre_tool_call",
         "output",
     }
+
+
+def test_an_invalid_regex_in_a_rule_condition_is_caught(tmp_path):
+    """The same silent fail-open as a bad redact pattern, in the other place a
+    model writes a regex. The builtin goes undefined, the body fails, and the
+    default allow answers, so a deny rule stops denying."""
+    plan = minimal_plan(
+        rules=[
+            {
+                "point": "input",
+                "decision": "deny",
+                "reason": "secret_in_prompt",
+                "conditions": [
+                    'regex.match("(?=secret)", input.policy_target.value.content)'
+                ],
+            }
+        ]
+    )
+    with pytest.raises(Exception) as excinfo:
+        generate(plan, tmp_path)
+    assert "(?=secret)" in str(excinfo.value)
+
+
+def test_a_valid_regex_in_a_rule_condition_is_accepted_and_fires(tmp_path):
+    plan = minimal_plan(
+        rules=[
+            {
+                "point": "input",
+                "decision": "deny",
+                "reason": "secret_in_prompt",
+                "conditions": [
+                    'regex.match("sk-[A-Za-z0-9]+", input.policy_target.value.content)'
+                ],
+            }
+        ]
+    )
+    result = GenerationEngine(StubLanguageModel([plan])).generate(
+        prompt=PROSE, out_dir=tmp_path / "out"
+    )
+
+    policy = ActivatedPolicy.activate(str(tmp_path / "out" / "manifest.yaml"))
+    context = AgentContextBuilder(agent_id="a", framework="t", session_id="s")
+    verdict = policy.evaluate("input", context.input(content="my key is sk-AbC123"))
+    assert (verdict.decision.value, verdict.reason) == ("deny", "secret_in_prompt")
+    assert result.slug
+
+
+def test_a_nested_regex_call_attributes_the_pattern_to_its_own_call(tmp_path):
+    """Argument scanning must respect nesting, or an inner call's pattern is
+    read as the outer call's and the real one goes unchecked."""
+    plan = minimal_plan(
+        rules=[
+            {
+                "point": "input",
+                "decision": "deny",
+                "reason": "blocked",
+                "conditions": [
+                    (
+                        'regex.match("ok_[0-9]+", regex.replace('
+                        'input.policy_target.value.content, "(?<=bad)", "x"))'
+                    )
+                ],
+            }
+        ]
+    )
+    with pytest.raises(Exception) as excinfo:
+        generate(plan, tmp_path)
+    assert "(?<=bad)" in str(excinfo.value)
+
+
+def test_a_guarded_tool_point_is_smoke_evaluated_with_no_catalog(monkeypatch, tmp_path):
+    """With no catalog the point was previously skipped while the report still
+    claimed every guarded point had been evaluated."""
+    import agent_control_spec_generator.validation as validation_module
+
+    seen: list[str] = []
+    original = validation_module._contexts_for
+
+    def record(point, builder, tool_names):
+        contexts = original(point, builder, tool_names)
+        seen.extend([point] * len(contexts))
+        return contexts
+
+    monkeypatch.setattr(validation_module, "_contexts_for", record)
+    generate(
+        minimal_plan(
+            guarded_points=["pre_tool_call"],
+            rules=[
+                {
+                    "point": "pre_tool_call",
+                    "decision": "deny",
+                    "reason": "too_large",
+                    "conditions": ["input.policy_target.value.amount > 10000"],
+                }
+            ],
+        ),
+        tmp_path,
+    )
+
+    assert seen.count("pre_tool_call") >= 1

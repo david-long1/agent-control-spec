@@ -13,13 +13,21 @@ written.
 
 from __future__ import annotations
 
+import shutil
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from .llm import LanguageModel
 from .manifest_builder import build_manifest, referenced_tool_names
-from .plan import PlanError, PolicyPlan, parse_policy_plan, redact_patterns
+from .plan import (
+    PlanError,
+    PolicyPlan,
+    condition_regex_patterns,
+    parse_policy_plan,
+    redact_patterns,
+)
 from .rego_builder import build_rego
 from .report import build_report
 from .validation import ValidationError, dump_manifest_yaml, validate_artifacts
@@ -121,7 +129,8 @@ class GenerationEngine:
                     manifest_yaml,
                     rego,
                     slug,
-                    regex_patterns=redact_patterns(plan),
+                    regex_patterns=redact_patterns(plan)
+                    + condition_regex_patterns(plan),
                 )
             except (PlanError, ValidationError) as exc:
                 diagnostics.append(f"attempt {attempt}: {exc}")
@@ -190,8 +199,34 @@ class GenerationEngine:
         return warnings
 
     def _write(self, out_dir: Path, result: GenerationResult) -> None:
-        policy_dir = out_dir / "policy"
-        policy_dir.mkdir(parents=True, exist_ok=True)
-        (out_dir / "manifest.yaml").write_text(result.manifest_yaml, encoding="utf-8")
-        (policy_dir / f"{result.slug}.rego").write_text(result.rego, encoding="utf-8")
-        (out_dir / "report.md").write_text(result.report, encoding="utf-8")
+        """Stage the whole tree, then swap it in.
+
+        A manifest names its bundle as a directory, and the engine loads every
+        Rego file in it. A module left behind by an earlier run under a
+        different slug is therefore still loaded, and one that does not
+        compile fails activation for a policy that validated moments earlier.
+        Writing in place also leaves the manifest and the policy installed
+        against a stale report when the last write fails, so the new tree is
+        built beside the target and moved over it.
+        """
+        out_dir.parent.mkdir(parents=True, exist_ok=True)
+        staging = Path(
+            tempfile.mkdtemp(prefix=f".{out_dir.name}.", dir=str(out_dir.parent))
+        )
+        try:
+            (staging / "policy").mkdir()
+            (staging / "manifest.yaml").write_text(
+                result.manifest_yaml, encoding="utf-8"
+            )
+            (staging / "policy" / f"{result.slug}.rego").write_text(
+                result.rego, encoding="utf-8"
+            )
+            (staging / "report.md").write_text(result.report, encoding="utf-8")
+            previous = out_dir / "policy"
+            if previous.is_dir():
+                shutil.rmtree(previous)
+            out_dir.mkdir(parents=True, exist_ok=True)
+            for entry in staging.iterdir():
+                shutil.move(str(entry), str(out_dir / entry.name))
+        finally:
+            shutil.rmtree(staging, ignore_errors=True)

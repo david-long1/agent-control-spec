@@ -59,11 +59,13 @@ directory must be empty, including on a second run over an earlier one. Pass
 | Tool inventory | `--tool NAME:LABEL,LABEL`, repeatable, and `--tools-file FILE` holding a JSON or YAML mapping of tool name to catalog entry |
 | Output directory | `--out DIR` |
 
-A tool the policy gates on should appear in the inventory. The generator
-recovers a tool name that only a rule mentions and adds a minimal catalog
-entry for it, then warns that the entry carries no metadata. A tool absent
-from the catalog entirely fails closed with `runtime_error:tool_unknown` on
-every call to it, so the recovery matters.
+A tool the policy gates on should appear in the inventory. Every tool you
+supply reaches the manifest catalog, whether or not a rule mentions it,
+because a tool missing from the catalog fails closed with
+`runtime_error:tool_unknown` on every call to it. Keeping only the referenced
+ones would brick the rest of the agent's tools the moment a tool point is
+guarded. A name that only a rule mentions is recovered and added with minimal
+metadata, and that is reported as a warning.
 
 ## Configuration
 
@@ -101,12 +103,13 @@ Validation runs against the engine, not against a copy of its rules.
 - The Rego module compiles under the engine that will evaluate it. Rego is
   compiled in process, so there is no external validator to install and no
   path that silently skips this.
-- Every redact pattern compiles under the engine's own regular expression
-  engine. This one catches a failure that is otherwise invisible. An invalid
+- Every redact pattern, and every regular expression a rule condition passes
+  to a Rego builtin, compiles under the engine's own regular expression
+  engine. These catch a failure that is otherwise invisible. An invalid
   pattern leaves the manifest valid and the module compiling, and at
   evaluation the builtin call goes undefined, the rule body fails, and the
-  default `allow` answers. The redaction reads exactly as authored and
-  removes nothing.
+  default `allow` answers. The rule reads exactly as authored and does
+  nothing.
 - Every guarded intervention point is evaluated against a well formed
   agent-hooks context and must return a policy verdict rather than a
   `runtime_error:*` fail closed deny. That catches an unresolvable policy
@@ -115,14 +118,22 @@ Validation runs against the engine, not against a copy of its rules.
 
 The plan gate refuses several shapes before compilation, each because the
 engine would otherwise accept the artifact and enforce less than it appears
-to. An unconditional blocking rule fires on every request at its point. A
-reason in the reserved `runtime_error:` namespace is rejected by the engine
-at evaluation. A redaction rooted at bare `$target` where the target is an
-object can never fire. A transform whose effects name two paths cannot
-compile faithfully, because a verdict carries one replacement. A transform at
-`agent_startup` or `agent_shutdown` is forbidden by AGENT-HOOKS-0.1 section
-4.3, and the engine will not catch that one, because rejecting it is the
-host's obligation rather than the interceptor's.
+to.
+
+| Refused | Why |
+| --- | --- |
+| A rule with no condition, or gated only by a tautology such as `true` | It fires on every request at its point |
+| A reason in the reserved `runtime_error:` namespace | The engine rejects it at evaluation |
+| A redaction rooted at bare `$target` where the target is an object | The `is_string` guard never holds, so the rule never fires |
+| A transform carrying no effect | It would replace the value with itself and report a rewrite |
+| Two transform rules at one point | Rules at a point are one else-chain, so only the first match runs |
+| A transform path naming a member the target does not have | Resolving the path is a host obligation, so it fails at the host, not here |
+| `$target.value` | The policy target already is the value |
+| A transform at `agent_startup` or `agent_shutdown` | Forbidden by AGENT-HOOKS-0.1 section 4.3, and the engine will not catch it, because rejecting it is the host's obligation |
+
+Where the predecessor silently repaired a path it did not recognize by
+resetting it to the root, this rejects instead, which turns a typo into a
+repair round rather than into a whole-value replacement.
 
 ## Python API
 

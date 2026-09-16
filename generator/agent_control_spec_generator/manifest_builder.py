@@ -34,6 +34,10 @@ _TOOL_FIELD = (
     r"""input\.tool(?:\.(?:name|id)|\[\s*(?:"(?:name|id)"|`(?:name|id)`)\s*\])"""
 )
 _TOOL_NAME_CONDITION = re.compile(rf"{_TOOL_FIELD}\s*==\s*{_STR}")
+# The same comparison with the operands the other way round, which a model
+# writes about as often. Missing it leaves the tool out of the catalog, so
+# `input.tool` stays null and the rule gating on it can never fire.
+_TOOL_NAME_CONDITION_REVERSED = re.compile(rf"{_STR}\s*==\s*{_TOOL_FIELD}")
 # The generator's own tool-id idiom, object.get(input.tool, "id",
 # object.get(input.tool, "name", "")) == "wire_transfer".
 _TOOL_GET_CONDITION = re.compile(rf"object\.get\(\s*input\.tool\b[^=]*==\s*{_STR}")
@@ -42,11 +46,15 @@ _TOOL_IN_CONDITION = re.compile(
     rf"(?:{_TOOL_FIELD}|object\.get\(\s*input\.tool\b[^{{\[]*?)\s+in\s+[\{{\[]([^}}\]]*)[\}}\]]"
 )
 _SET_STRING = re.compile(_STR)
-# Annotation reads in dot, bracket, or object.get form.
-_ANNOTATION_REF = re.compile(
-    rf"input\.annotations(?:\.([A-Za-z_][A-Za-z0-9_]*)|\[\s*{_STR}\s*\])"
+# `annotations` reached by dot or by bracket, then the annotator name by
+# either form again.
+_ANNOTATIONS_ROOT = (
+    r"""input(?:\.annotations|\[\s*(?:"annotations"|`annotations`)\s*\])"""
 )
-_ANNOTATION_GET = re.compile(rf"object\.get\(\s*input\.annotations\s*,\s*{_STR}")
+_ANNOTATION_REF = re.compile(
+    rf"{_ANNOTATIONS_ROOT}(?:\.([A-Za-z_][A-Za-z0-9_]*)|\[\s*{_STR}\s*\])"
+)
+_ANNOTATION_GET = re.compile(rf"object\.get\(\s*{_ANNOTATIONS_ROOT}\s*,\s*{_STR}")
 
 
 def _match_string(match: re.Match[str], first_group: int) -> str:
@@ -88,14 +96,40 @@ def referenced_tool_names(plan: PolicyPlan) -> list[str]:
     names: dict[str, None] = {name: None for name in plan.tools if name}
     for rule in plan.rules:
         for condition in rule.conditions:
-            for match in _TOOL_NAME_CONDITION.finditer(condition):
-                names.setdefault(_match_string(match, 1), None)
-            for match in _TOOL_GET_CONDITION.finditer(condition):
+            for pattern in (_TOOL_NAME_CONDITION, _TOOL_GET_CONDITION):
+                for match in pattern.finditer(condition):
+                    names.setdefault(_match_string(match, 1), None)
+            for match in _TOOL_NAME_CONDITION_REVERSED.finditer(condition):
                 names.setdefault(_match_string(match, 1), None)
             for match in _TOOL_IN_CONDITION.finditer(condition):
                 for literal in _SET_STRING.finditer(match.group(1)):
                     names.setdefault(_match_string(literal, 1), None)
     return sorted(names)
+
+
+def build_tool_catalog(
+    plan: PolicyPlan, tool_inventory: dict[str, dict[str, Any]]
+) -> dict[str, dict[str, Any]]:
+    """The manifest tool catalog.
+
+    Every tool the caller supplied is carried, not only the ones a rule
+    mentions. A supplied tool left out of the catalog fails closed with
+    `runtime_error:tool_unknown` on every call to it, so dropping the
+    unreferenced ones would brick the rest of the agent's tools the moment a
+    tool point is guarded.
+
+    Each entry gets `id` and `name` when it lacks them, because the generated
+    rules gate on `input.tool.id` and fall back to `input.tool.name`, and an
+    entry carrying neither leaves both undefined.
+    """
+    catalog: dict[str, dict[str, Any]] = {}
+    for name in sorted({*tool_inventory, *referenced_tool_names(plan)}):
+        entry = dict(tool_inventory.get(name) or {})
+        entry.setdefault("type", "Tool")
+        entry.setdefault("id", name)
+        entry.setdefault("name", name)
+        catalog[name] = entry
+    return catalog
 
 
 def build_manifest(
@@ -105,10 +139,7 @@ def build_manifest(
     slug = slugify(plan.name)
     policy_id = slug
     annotators_by_point = referenced_annotators_by_point(plan)
-    tools = {
-        name: tool_inventory.get(name, {"type": "Tool", "id": name})
-        for name in referenced_tool_names(plan)
-    }
+    tools = build_tool_catalog(plan, tool_inventory)
     manifest: dict[str, Any] = {
         "agent_control_specification_version": manifest_version(),
         "metadata": {"name": slug},

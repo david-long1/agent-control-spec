@@ -127,15 +127,33 @@ def test_removed_policy_target_root_is_named_in_the_diagnostic():
 
 
 def test_transform_effects_targeting_two_paths_are_rejected():
-    """A verdict carries one transform, one path and one value."""
+    """A verdict carries one transform, one path and one value. Uses `input`,
+    where both members exist, so this isolates the multiple-path rule from the
+    unknown-member one."""
     plan = _transform_plan(
+        point="input",
         effects=[
             {"type": "replace", "path": "$target.content", "value": "a"},
             {"type": "replace", "path": "$target.role", "value": "b"},
-        ]
+        ],
     )
     with pytest.raises(PlanError, match="single path"):
         parse(plan)
+
+
+def test_a_transform_path_naming_an_absent_member_is_rejected():
+    """The engine validates the path grammar and returns the verdict.
+    Resolving it against the target is a host obligation, so a syntactically
+    valid path naming a member that does not exist passes every downstream
+    check and then fails at the host on every firing."""
+    plan = _transform_plan(
+        point="output",
+        effects=[{"type": "replace", "path": "$target.text", "value": "x"}],
+    )
+    with pytest.raises(PlanError) as excinfo:
+        parse(plan)
+    assert "'text'" in str(excinfo.value)
+    assert "would not resolve" in str(excinfo.value)
 
 
 def test_mixing_replace_and_redact_is_rejected():
@@ -226,6 +244,8 @@ def test_tool_entries_accept_strings_and_objects():
 
 
 def _transform_plan(*, point: str = "output", effects: list) -> dict:
+    # A real condition, because a tautology is now refused in its own right
+    # and would mask the rejection each caller is actually testing.
     return minimal_plan(
         guarded_points=[point],
         rules=[
@@ -233,8 +253,94 @@ def _transform_plan(*, point: str = "output", effects: list) -> dict:
                 "point": point,
                 "decision": "transform",
                 "reason": "rewrite",
-                "conditions": ["true"],
+                "conditions": ['contains(input.policy_target.value.content, "secret")'],
                 "effects": effects,
             }
         ],
     )
+
+
+def test_a_transform_with_no_effect_is_rejected():
+    """With no usable effect the renderer can only emit an identity
+    transform, which reports a rewrite and returns the value untouched. A rule
+    presented as a redaction would pass every check and redact nothing."""
+    plan = minimal_plan(
+        guarded_points=["output"],
+        rules=[
+            {
+                "point": "output",
+                "decision": "transform",
+                "reason": "redact",
+                "conditions": ['contains(input.policy_target.value.content, "acct")'],
+                "effects": [],
+            }
+        ],
+    )
+    with pytest.raises(PlanError, match="carries no effect"):
+        parse(plan)
+
+
+@pytest.mark.parametrize("condition", ["true", "1 == 1", "  true  ", "input"])
+def test_a_tautological_condition_does_not_count_as_a_gate(condition: str):
+    """A non-allow rule gated only by a tautology fires on every request at
+    its point, which is the same outage as no condition at all."""
+    plan = minimal_plan()
+    plan["rules"][0]["conditions"] = [condition]
+    with pytest.raises(PlanError, match="selects every request"):
+        parse(plan)
+
+
+def test_a_tautology_alongside_a_real_condition_is_fine():
+    plan = minimal_plan()
+    plan["rules"][0]["conditions"] = [
+        "true",
+        'contains(input.policy_target.value.content, "forbidden")',
+    ]
+    assert len(parse(plan).rules[0].conditions) == 2
+
+
+def test_condition_regexes_are_collected_from_every_builtin():
+    from agent_control_spec_generator.plan import condition_regex_patterns
+
+    plan = parse(
+        minimal_plan(
+            rules=[
+                {
+                    "point": "input",
+                    "decision": "deny",
+                    "reason": "blocked",
+                    "conditions": [
+                        'regex.match("a[0-9]+", input.policy_target.value.content)',
+                        'regex.replace(input.policy_target.value.content, "b[0-9]+", "x") != ""',
+                        "count(regex.split(`c[0-9]+`, input.policy_target.value.content)) > 1",
+                    ],
+                }
+            ]
+        )
+    )
+
+    assert condition_regex_patterns(plan) == ("a[0-9]+", "b[0-9]+", "c[0-9]+")
+
+
+def test_a_computed_regex_pattern_is_reported_rather_than_guessed():
+    """A pattern built at runtime cannot be checked statically. It is skipped
+    rather than approximated, and it evaluates to undefined rather than
+    matching loosely, so skipping it does not widen anything."""
+    from agent_control_spec_generator.plan import condition_regex_patterns
+
+    plan = parse(
+        minimal_plan(
+            rules=[
+                {
+                    "point": "input",
+                    "decision": "deny",
+                    "reason": "blocked",
+                    "conditions": [
+                        "regex.match(pattern, input.policy_target.value.content)"
+                    ],
+                }
+            ]
+        )
+    )
+
+    assert condition_regex_patterns(plan) == ()

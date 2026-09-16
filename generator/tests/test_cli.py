@@ -13,11 +13,13 @@ import json
 
 import pytest
 import yaml
+from agent_control_spec import ActivatedPolicy
 from agent_control_spec_generator import cli
 from agent_control_spec_generator.llm import (
     OpenAICompatibleLanguageModel,
     StubLanguageModel,
 )
+from agent_hooks import AgentContextBuilder
 from conftest import PAYMENTS_PLAN, minimal_plan
 
 
@@ -152,6 +154,8 @@ def test_a_malformed_tool_flag_is_reported(scripted, tmp_path, capsys):
     "suffix,dump", [(".json", json.dumps), (".yaml", yaml.safe_dump)]
 )
 def test_a_tools_file_is_read_in_either_format(scripted, tmp_path, suffix, dump):
+    """Asserts the entry actually gates a decision, not merely that it was
+    serialized into the manifest."""
     tools_file = tmp_path / f"tools{suffix}"
     tools_file.write_text(
         dump({"lookup": {"type": "Tool", "clearance": "internal"}}), encoding="utf-8"
@@ -181,6 +185,15 @@ def test_a_tools_file_is_read_in_either_format(scripted, tmp_path, suffix, dump)
     assert code == 0
     document = yaml.safe_load((out / "manifest.yaml").read_text(encoding="utf-8"))
     assert document["tools"]["lookup"]["clearance"] == "internal"
+
+    policy = ActivatedPolicy.activate(str(out / "manifest.yaml"))
+    verdict = policy.evaluate(
+        "pre_tool_call",
+        AgentContextBuilder(agent_id="a", framework="t", session_id="s").pre_tool_call(
+            call_id="c", name="lookup", args={}
+        ),
+    )
+    assert (verdict.decision.value, verdict.reason) == ("deny", "blocked")
 
 
 def test_a_tools_file_that_is_not_a_mapping_is_reported(scripted, tmp_path, capsys):
@@ -307,3 +320,63 @@ def test_help_documents_the_output_layout_and_the_review_requirement(capsys):
     assert "report.md" in text
     assert "draft for human review, never an approved control" in text
     assert "ACS_GENERATOR_API_KEY" in text
+
+
+def test_a_credentialed_request_does_not_follow_a_redirect(monkeypatch):
+    """The request carries the provider credential in a header. Following a
+    redirect would re-issue it against whatever host the response named."""
+    import json as _json
+    import threading
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    seen: dict[str, str | None] = {}
+
+    class Redirector(BaseHTTPRequestHandler):
+        def do_POST(self):
+            seen["first"] = self.headers.get("Authorization")
+            self.send_response(302)
+            self.send_header("Location", f"http://127.0.0.1:{second.server_port}/v1")
+            self.end_headers()
+
+        def log_message(self, *args):
+            pass
+
+    class Destination(BaseHTTPRequestHandler):
+        def do_POST(self):
+            seen["second"] = self.headers.get("Authorization")
+            body = _json.dumps({"choices": [{"message": {"content": "{}"}}]}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args):
+            pass
+
+    first = HTTPServer(("127.0.0.1", 0), Redirector)
+    second = HTTPServer(("127.0.0.1", 0), Destination)
+    for server in (first, second):
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        model = OpenAICompatibleLanguageModel(
+            api_base=f"http://127.0.0.1:{first.server_port}/v1",
+            api_key="SECRET-KEY",
+        )
+        with pytest.raises(RuntimeError):
+            model.complete("system", "user")
+    finally:
+        first.shutdown()
+        second.shutdown()
+
+    assert seen.get("first") == "Bearer SECRET-KEY"
+    assert "second" not in seen, "the credential must not reach the redirect target"
+
+
+def test_a_key_with_a_control_character_is_refused_before_the_request():
+    """http.client would otherwise raise with the header value in the message,
+    and the CLI prints the message."""
+    model = OpenAICompatibleLanguageModel(api_key="sk-good\nInjected: header")
+
+    with pytest.raises(RuntimeError, match="control character"):
+        model.complete("system", "user")

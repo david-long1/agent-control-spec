@@ -313,33 +313,27 @@ def test_a_rule_at_an_unguarded_point_still_guards_that_point(tmp_path):
     assert (verdict.decision.value, verdict.reason) == ("deny", "leaked")
 
 
-def test_target_dot_value_is_normalized_to_the_root(tmp_path):
+def test_target_dot_value_is_rejected_rather_than_silently_rewritten(tmp_path):
     """Models append `.value`, conflating the transform root with the
-    `input.policy_target.value` read path. The policy target is the value,
-    so the engine rejects indexing into a scalar with it."""
-    plan = minimal_plan(
-        guarded_points=["post_tool_call"],
-        tools=["lookup"],
-        rules=[
-            {
-                "point": "post_tool_call",
-                "decision": "transform",
-                "reason": "mask",
-                "conditions": ['input.tool.id == "lookup"'],
-                "effects": [
-                    {
-                        "type": "redact",
-                        "path": "$target.value",
-                        "pattern": "acct_[0-9]+",
-                    }
-                ],
-            }
-        ],
-    )
-    result, _ = generate([plan], tmp_path)
+    `input.policy_target.value` read path. The predecessor reset any path it
+    did not recognise to bare `$target`, which turns a typo into a whole-value
+    replacement. Rejecting lets the repair loop fix the path instead."""
+    plan = _tool_redaction_plan("$target.value")
+
+    with pytest.raises(GenerationError) as excinfo:
+        GenerationEngine(StubLanguageModel([plan]), max_attempts=1).generate(
+            prompt=PROSE, out_dir=tmp_path / "out", write=False
+        )
+
+    assert "already is the value" in str(excinfo.value)
+
+
+def test_a_redaction_at_the_tool_result_root_compiles_and_fires(tmp_path):
+    """The complementary case. At `post_tool_call` the target may itself be a
+    string, so the bare root is the right path there."""
+    result, _ = generate([_tool_redaction_plan("$target")], tmp_path)
 
     assert '"path": "$target"' in result.rego
-    assert "$target.value" not in result.rego
     policy = ActivatedPolicy.activate(str(tmp_path / "out" / "manifest.yaml"))
     verdict = policy.evaluate(
         "post_tool_call",
@@ -349,6 +343,22 @@ def test_target_dot_value_is_normalized_to_the_root(tmp_path):
     )
     assert verdict.decision.value == "transform"
     assert verdict.transform.value == "found [REDACTED]"
+
+
+def _tool_redaction_plan(path: str) -> dict:
+    return minimal_plan(
+        guarded_points=["post_tool_call"],
+        tools=["lookup"],
+        rules=[
+            {
+                "point": "post_tool_call",
+                "decision": "transform",
+                "reason": "mask",
+                "conditions": ['input.tool.id == "lookup"'],
+                "effects": [{"type": "redact", "path": path, "pattern": "acct_[0-9]+"}],
+            }
+        ],
+    )
 
 
 def test_effects_on_a_non_transform_decision_are_dropped_and_reported(tmp_path):
@@ -469,3 +479,207 @@ def test_importing_the_package_reads_no_credential_and_calls_nothing(monkeypatch
 
     assert completed.returncode == 0, completed.stderr
     assert completed.stdout.strip() == "True"
+
+
+def test_every_supplied_tool_reaches_the_catalog(tmp_path):
+    """A supplied tool left out of the catalog fails closed with
+    `runtime_error:tool_unknown` on every call to it. Keeping only the tools a
+    rule happens to mention therefore bricks the rest of the agent's tools the
+    moment a tool point is guarded."""
+    inventory = {
+        "wire_transfer": {"type": "Tool", "id": "wire_transfer"},
+        "lookup_balance": {"type": "Tool", "id": "lookup_balance"},
+        "send_email": {"type": "Tool"},
+    }
+    plan = minimal_plan(
+        guarded_points=["pre_tool_call"],
+        tools=["wire_transfer"],
+        rules=[
+            {
+                "point": "pre_tool_call",
+                "decision": "deny",
+                "reason": "blocked",
+                "conditions": ['input.tool.id == "wire_transfer"'],
+            }
+        ],
+    )
+    generate([plan], tmp_path, tool_inventory=inventory)
+    policy = ActivatedPolicy.activate(str(tmp_path / "out" / "manifest.yaml"))
+    b = builder()
+
+    blocked = policy.evaluate(
+        "pre_tool_call", b.pre_tool_call(call_id="c", name="wire_transfer", args={})
+    )
+    assert (blocked.decision.value, blocked.reason) == ("deny", "blocked")
+    for name in ("lookup_balance", "send_email"):
+        verdict = policy.evaluate(
+            "pre_tool_call", b.pre_tool_call(call_id="c", name=name, args={})
+        )
+        assert verdict.decision.value == "allow", (
+            f"{name} was bricked: {verdict.reason}"
+        )
+
+
+def test_a_catalog_entry_without_an_id_still_gates_on_tool_id(tmp_path):
+    """Generated rules read `input.tool.id` and fall back to
+    `input.tool.name`. An entry carrying neither leaves both undefined, so the
+    rule can never fire."""
+    plan = minimal_plan(
+        guarded_points=["pre_tool_call"],
+        tools=["send_email"],
+        rules=[
+            {
+                "point": "pre_tool_call",
+                "decision": "deny",
+                "reason": "no_email",
+                "conditions": ['input.tool.id == "send_email"'],
+            }
+        ],
+    )
+    generate([plan], tmp_path, tool_inventory={"send_email": {"type": "Tool"}})
+    policy = ActivatedPolicy.activate(str(tmp_path / "out" / "manifest.yaml"))
+
+    verdict = policy.evaluate(
+        "pre_tool_call",
+        builder().pre_tool_call(call_id="c", name="send_email", args={}),
+    )
+    assert (verdict.decision.value, verdict.reason) == ("deny", "no_email")
+
+
+def test_a_tool_name_compared_the_other_way_round_is_recovered(tmp_path):
+    plan = minimal_plan(
+        guarded_points=["pre_tool_call"],
+        tools=[],
+        rules=[
+            {
+                "point": "pre_tool_call",
+                "decision": "deny",
+                "reason": "forbidden_tool",
+                "conditions": ['"delete_files" == input.tool.id'],
+            }
+        ],
+    )
+    generate([plan], tmp_path)
+    policy = ActivatedPolicy.activate(str(tmp_path / "out" / "manifest.yaml"))
+
+    verdict = policy.evaluate(
+        "pre_tool_call",
+        builder().pre_tool_call(call_id="c", name="delete_files", args={}),
+    )
+    assert (verdict.decision.value, verdict.reason) == ("deny", "forbidden_tool")
+
+
+def test_a_fully_bracketed_annotation_read_is_wired(tmp_path):
+    plan = minimal_plan(
+        rules=[
+            {
+                "point": "input",
+                "decision": "deny",
+                "reason": "pii_detected",
+                "conditions": ['input["annotations"]["pii"].detected == true'],
+            }
+        ],
+    )
+    generate([plan], tmp_path)
+    policy = ActivatedPolicy.activate(
+        str(tmp_path / "out" / "manifest.yaml"),
+        annotator_dispatcher=lambda name, annotator, prelim: {"detected": True},
+    )
+
+    verdict = policy.evaluate("input", builder().input(content="anything"))
+    assert (verdict.decision.value, verdict.reason) == ("deny", "pii_detected")
+
+
+def test_a_stale_policy_module_does_not_survive_regeneration(tmp_path):
+    """A manifest names its bundle as a directory and the engine loads every
+    Rego file in it, so a module left by an earlier run under a different slug
+    is still loaded and can fail activation for a policy that just validated."""
+    out = tmp_path / "out"
+    generate([minimal_plan(name="First")], tmp_path)
+    stale = out / "policy" / "stale.rego"
+    stale.write_text("package broken\n\nbroken ::= \n", encoding="utf-8")
+
+    GenerationEngine(StubLanguageModel([minimal_plan(name="Second")])).generate(
+        prompt=PROSE, out_dir=out
+    )
+
+    assert not stale.exists()
+    assert sorted(p.name for p in (out / "policy").iterdir()) == ["second.rego"]
+    ActivatedPolicy.activate(str(out / "manifest.yaml"))
+
+
+def test_two_transform_rules_at_one_point_are_rejected(tmp_path):
+    """Rules at a point compile to one else-chain, so the first match wins and
+    the second redaction never runs. Its sensitive value would be emitted in
+    full by a policy that reads as though it removes both."""
+    plan = minimal_plan(
+        guarded_points=["output"],
+        rules=[
+            {
+                "point": "output",
+                "decision": "transform",
+                "reason": "redact_account",
+                "conditions": ['contains(input.policy_target.value.content, "acct_")'],
+                "effects": [
+                    {
+                        "type": "redact",
+                        "path": "$target.content",
+                        "pattern": "acct_[0-9]+",
+                    }
+                ],
+            },
+            {
+                "point": "output",
+                "decision": "transform",
+                "reason": "redact_token",
+                "conditions": ['contains(input.policy_target.value.content, "tok_")'],
+                "effects": [
+                    {
+                        "type": "redact",
+                        "path": "$target.content",
+                        "pattern": "tok_[a-z]+",
+                    }
+                ],
+            },
+        ],
+    )
+    with pytest.raises(GenerationError) as excinfo:
+        GenerationEngine(StubLanguageModel([plan]), max_attempts=1).generate(
+            prompt=PROSE, out_dir=tmp_path / "out", write=False
+        )
+    assert "only the first matching one" in str(excinfo.value)
+
+
+def test_one_rule_carrying_both_patterns_redacts_both(tmp_path):
+    """The expressible form the rejection above points the model at."""
+    plan = minimal_plan(
+        guarded_points=["output"],
+        rules=[
+            {
+                "point": "output",
+                "decision": "transform",
+                "reason": "redact_secrets",
+                "conditions": ['contains(input.policy_target.value.content, "_")'],
+                "effects": [
+                    {
+                        "type": "redact",
+                        "path": "$target.content",
+                        "pattern": "acct_[0-9]+",
+                    },
+                    {
+                        "type": "redact",
+                        "path": "$target.content",
+                        "pattern": "tok_[a-z]+",
+                    },
+                ],
+            }
+        ],
+    )
+    generate([plan], tmp_path)
+    policy = ActivatedPolicy.activate(str(tmp_path / "out" / "manifest.yaml"))
+
+    verdict = policy.evaluate(
+        "output", builder().output(content="acct_4242 and tok_abc")
+    )
+    assert verdict.decision.value == "transform"
+    assert verdict.transform.value == "[REDACTED] and [REDACTED]"

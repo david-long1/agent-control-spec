@@ -115,6 +115,24 @@ TARGET_SHAPES = {
 #: default `allow` answers, and the redaction silently does nothing.
 STRING_TARGET_POINTS = frozenset({"post_tool_call"})
 
+#: Members of `$target` at points whose shape is fixed by AGENT-HOOKS-0.1
+#: section 4.2. A transform path naming anything else does not resolve, and
+#: the engine does not catch that: it validates the path grammar and returns
+#: the verdict, leaving resolution to the host, which then fails on every
+#: firing. Points whose target is caller-shaped (tool arguments, a tool
+#: result) or is an array (`pre_model_call`) are absent, because no member
+#: set can be known for them.
+TARGET_MEMBERS = {
+    "input": frozenset({"content", "role"}),
+    "post_model_call": frozenset({"content", "tool_calls", "finish_reason"}),
+    "output": frozenset({"content"}),
+}
+
+#: Rego body lines that select nothing. A non-allow rule whose only condition
+#: is one of these fires on every request at its point, which is the same
+#: outage as no condition at all.
+TAUTOLOGIES = frozenset({"true", "1 == 1", "1==1", "input", "input != null"})
+
 #: Points at which AGENT-HOOKS-0.1 section 4.3 forbids a transform. A host
 #: MUST reject one with `host_error:transform_target_forbidden`. The ACS
 #: engine does not reject it, because the obligation is the host's, so a

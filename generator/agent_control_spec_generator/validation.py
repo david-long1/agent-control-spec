@@ -234,15 +234,27 @@ def smoke_evaluate(
     builder = AgentContextBuilder(
         agent_id="acs-generator", framework="acs-generator", session_id="smoke"
     )
+    evaluated = 0
     for point in manifest["intervention_points"]:
-        for context in _contexts_for(point, builder, tool_names):
+        contexts = _contexts_for(point, builder, tool_names)
+        if not contexts:
+            raise ValidationError(
+                f"no smoke context could be built for guarded point '{point}', so it "
+                "would be reported as evaluated without being evaluated"
+            )
+        for context in contexts:
             verdict = policy.evaluate(point, context)
+            evaluated += 1
             reason = verdict.reason or ""
             if reason.startswith("runtime_error:"):
                 raise ValidationError(
                     f"generated policy fails closed at '{point}' on a well-formed "
                     f"agent-hooks context with {reason}"
                 )
+    if evaluated < len(
+        manifest["intervention_points"]
+    ):  # pragma: no cover - guarded above
+        raise ValidationError("smoke evaluation skipped a guarded intervention point")
     if not tool_names:
         guarded_tool_points = [
             point
@@ -266,9 +278,13 @@ def _contexts_for(
 
     Every declared tool gets its own context at a tool point, because tool
     projection is per call and an entry the catalog declares but cannot
-    project would otherwise go unexercised.
+    project would otherwise go unexercised. With no catalog the point is
+    still exercised once with an arbitrary tool name, because the manifest
+    then omits `tool_name_from` and nothing is projected. Skipping it would
+    leave a guarded point unevaluated while the report claims otherwise.
     """
     text = "acs-generator smoke evaluation"
+    names = tool_names or ["acs_generator_smoke_tool"]
     if point == "agent_startup":
         return [builder.agent_startup(tools_registered=list(tool_names))]
     if point == "input":
@@ -292,14 +308,14 @@ def _contexts_for(
     if point == "pre_tool_call":
         return [
             builder.pre_tool_call(call_id=f"smoke-{name}", name=name, args={})
-            for name in tool_names
+            for name in names
         ]
     if point == "post_tool_call":
         return [
             builder.post_tool_call(
                 call_id=f"smoke-{name}", name=name, args={}, value=text
             )
-            for name in tool_names
+            for name in names
         ]
     if point == "output":
         return [builder.output(content=text)]

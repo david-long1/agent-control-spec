@@ -64,6 +64,13 @@ class OpenAICompatibleLanguageModel:
                 "no API key. Pass --api-key or set ACS_GENERATOR_API_KEY, or supply "
                 "your own LanguageModel to GenerationEngine"
             )
+        if any(char in self.api_key for char in "\r\n\x00"):
+            # A key carrying a control character makes http.client raise with
+            # the header value in the message, and the CLI prints the message.
+            raise RuntimeError(
+                "the API key contains a control character; check for a stray newline "
+                "in the environment variable or the flag"
+            )
         payload = {
             "model": self.model,
             "messages": [
@@ -88,7 +95,7 @@ class OpenAICompatibleLanguageModel:
             method="POST",
         )
         try:
-            with request.urlopen(req, timeout=REQUEST_TIMEOUT_SECONDS) as response:
+            with _NO_REDIRECTS.open(req, timeout=REQUEST_TIMEOUT_SECONDS) as response:
                 body = json.loads(response.read().decode("utf-8"))
         except error.HTTPError as exc:
             raise RuntimeError(_http_error_detail(exc)) from exc
@@ -98,6 +105,21 @@ class OpenAICompatibleLanguageModel:
             raise RuntimeError(
                 f"provider returned no completion content: {json.dumps(body)[:400]}"
             ) from exc
+
+
+class _NoRedirects(request.HTTPRedirectHandler):
+    """Refuse to follow a redirect on a credentialed request.
+
+    The request carries the provider credential in a header. Following a
+    redirect would re-issue it against whatever host the response named, so
+    the redirect is surfaced as an error and the caller decides.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+_NO_REDIRECTS = request.build_opener(_NoRedirects)
 
 
 def _is_azure_api_base(api_base: str) -> bool:
