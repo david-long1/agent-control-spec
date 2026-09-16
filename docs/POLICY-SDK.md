@@ -40,8 +40,8 @@ it, and with any resolver configured to exclude pre-releases. Pinning the
 exact version, as above, sidesteps both.
 
 Published wheels are `cp311-abi3` for ACS and `cp310-abi3` for
-agent-hooks. The examples below were run on CPython 3.12 on Linux
-x86-64.
+agent-hooks, and the ACS metadata requires Python 3.11 or newer. The
+examples below were run on CPython 3.12 on Linux x86-64.
 
 Two version facts worth pinning down before writing a manifest:
 

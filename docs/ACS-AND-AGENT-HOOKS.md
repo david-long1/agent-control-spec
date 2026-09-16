@@ -33,8 +33,8 @@ agent-hooks arrives as an ACS dependency, and ACS pins it exactly
 unnecessary; asking for a different version gives you
 `ResolutionImpossible` rather than a working environment. Every
 published version of both packages is a pre-release, so pinning the
-exact version means you do not need `--pre`. Tested on CPython 3.12,
-Linux x86-64.
+exact version means you do not need `--pre`. ACS requires Python 3.11 or
+newer. Tested on CPython 3.12, Linux x86-64.
 
 ## Registering ACS as a control
 
