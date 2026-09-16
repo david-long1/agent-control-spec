@@ -54,8 +54,20 @@ jobs:
         run: |
           uv pip install --system -r sdk/python/requirements-dev.lock
           uv pip install --system --no-deps --no-build-isolation -e ./sdk/python
-      - run: ruff format --check sdk/python scripts && ruff check sdk/python scripts
+      - run: ruff format --check sdk/python scripts generator && ruff check sdk/python scripts generator
       - run: pytest sdk/python/tests -v
+      - name: Install and test the policy generator
+        # --no-deps because agent-control-spec is already installed above from
+        # this tree; resolving it would pull the published wheel instead and
+        # the generator would then be validated against a different engine
+        # than the one under test. PyYAML is the generator's only other
+        # dependency and is pinned here rather than added to
+        # requirements-dev.lock, which is compiled output shared with the
+        # binding's own job.
+        run: |
+          uv pip install --system pyyaml==6.0.3
+          uv pip install --system --no-deps ./generator
+          pytest generator -v
 
   # Cross-platform build+test of the Rust workspace plus one binding's
   # suite (Python: the maturin wheel builds and pytest runs on every OS).
