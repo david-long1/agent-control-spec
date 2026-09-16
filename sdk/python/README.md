@@ -96,6 +96,9 @@ engine accepts. Read it rather than hardcoding the set.
 Trust model: a cooperative contract, not a security boundary — the host
 is fully trusted. See the repository's SECURITY.md.
 
+Guides: [loading and evaluating a policy](../../docs/POLICY-SDK.md), and
+[running ACS alongside other controls](../../docs/ACS-AND-AGENT-HOOKS.md).
+
 Benchmark: `python sdk/python/bench/activation_bench.py` runs against
 `examples/bank_agent`, reporting activation cost, first-evaluate cost,
 warm p50/p95/p99, and a thread-count throughput sweep up to 32.

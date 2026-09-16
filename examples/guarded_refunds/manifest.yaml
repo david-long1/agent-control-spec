@@ -1,0 +1,55 @@
+agent_control_specification_version: 0.4.0-alpha.1
+metadata:
+  name: guarded_refunds
+  description: >-
+    Refund guardrails for a support agent. Binds three of the eight
+    interception points on purpose, so the example can show what a host
+    must do about the five it leaves unbound.
+policies:
+  refund_guardrails:
+    type: rego
+    bundle: ./policy
+    query: data.guarded_refunds.verdict
+intervention_points:
+  input:
+    policy_target: $.input
+    policy_target_kind: user_input
+    policy:
+      id: refund_guardrails
+      query: data.guarded_refunds.input_verdict
+    annotations:
+      injection_risk:
+        from: $target
+  pre_tool_call:
+    policy_target: $.tool_call.args
+    policy_target_kind: tool_args
+    policy:
+      id: refund_guardrails
+      query: data.guarded_refunds.pre_tool_call_verdict
+    tool_name_from: $.tool_call.name
+    annotations:
+      refund_risk:
+        from: $target
+  output:
+    policy_target: $.output
+    policy_target_kind: assistant_output
+    policy:
+      id: refund_guardrails
+      query: data.guarded_refunds.output_verdict
+    annotations:
+      pii_scan:
+        from: $target
+tools:
+  lookup_order:
+    type: Tool
+    id: lookup_order
+  issue_refund:
+    type: Tool
+    id: issue_refund
+annotators:
+  injection_risk:
+    type: classifier
+  refund_risk:
+    type: classifier
+  pii_scan:
+    type: classifier

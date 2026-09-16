@@ -39,6 +39,16 @@ those are host obligations defined by agent-hooks.
 | `fixtures/` | Evaluation fixtures |
 | `docs/EXTRACTION.md` | Provenance map from the previous tree |
 
+## Guides
+
+| Guide | For |
+| --- | --- |
+| [`docs/POLICY-SDK.md`](docs/POLICY-SDK.md) | Loading a policy, supplying evaluation input, and acting on the verdict |
+| [`docs/ACS-AND-AGENT-HOOKS.md`](docs/ACS-AND-AGENT-HOOKS.md) | Running ACS alongside other controls, and letting agent-hooks compose them |
+
+Both are written against the published packages and share one runnable
+example, [`examples/guarded_refunds/`](examples/guarded_refunds/).
+
 ## Status
 
 `0.4.0-alpha.3`, an alpha of the re-based runtime. Depends on
