@@ -149,8 +149,8 @@ When the seam gets consulted depends on the profile:
   first, then consult at most once, and only when the aggregate winner
   is liftable.
 
-Under the first two of those, a plain deny wins outright and is never
-offered for approval. `parallel/unanimous` is the exception, and it is
+In every profile but one, a plain deny wins outright and is never
+offered for approval. The exception is `parallel/unanimous`, and it is
 easy to miss: with `on_disagreement: approval`, one control allowing and
 another denying outright is a *disagreement*, and the host synthesizes a
 liftable deny from it. An approver can then permit an action that a
