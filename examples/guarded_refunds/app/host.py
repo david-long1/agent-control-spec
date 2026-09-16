@@ -74,6 +74,13 @@ def activate(annotators: LocalAnnotators | None = None) -> ActivatedPolicy:
     )
 
 
+class TurnBlocked(RuntimeError):
+    """The host refused this turn; later work on it is a host bug."""
+
+    def __init__(self, session_id: str) -> None:
+        super().__init__(f"turn refused for session {session_id!r}; start a new turn")
+
+
 @dataclass(frozen=True)
 class Guarded:
     """What the host learned from one emission."""
@@ -97,11 +104,12 @@ class RefundSession:
 
     Concurrency, stated plainly: this object is safe to use from one
     task at a time. Work that runs in a child task, a thread, or a
-    subprocess needs its own session built from the same activation and
-    the same session identity, so the required controls and the trusted
-    context travel with it. Sharing one emitter across everything
-    interleaves sequence numbers and record buffers between logically
-    separate emissions.
+    subprocess needs its own emitter and builder, because those carry
+    per-emission state. It must not get its own *controls*: use
+    :meth:`for_child_task`, which keeps the same activation, the same
+    stateful controls and the same tools, so the spend cap and the
+    ledger stay shared. Rebuilding the controls instead gives the child
+    a second full budget, and the cap stops meaning anything.
     """
 
     def __init__(
@@ -116,10 +124,18 @@ class RefundSession:
         timeout: float | None = 5.0,
         record_sink: Callable[[InterceptionRecord], None] | None = None,
         extra_controls: Iterable[tuple[str, Interceptor]] = (),
+        tools: RefundTools | None = None,
+        budget: RefundBudgetControl | None = None,
+        acs: AcsControl | None = None,
     ) -> None:
-        self.tools = RefundTools()
-        self.budget = RefundBudgetControl(budget_cap)
-        self.acs = AcsControl(policy)
+        self.policy = policy
+        self.session_id = session_id
+        # Passed in when this session continues an existing one; built
+        # fresh when it starts one.
+        self.tools = tools if tools is not None else RefundTools()
+        self.budget = budget if budget is not None else RefundBudgetControl(budget_cap)
+        self.acs = acs if acs is not None else AcsControl(policy)
+        self._turn_blocked = False
 
         self.emitter = InterceptionEmitter(
             mode=mode,
@@ -145,15 +161,50 @@ class RefundSession:
             session_id=session_id,
         )
 
+    def for_child_task(self, *, suffix: str) -> RefundSession:
+        """A session for work that continues this one elsewhere.
+
+        New emitter and new builder, because those carry per-emission
+        state. Same activation, same controls, same tools, so the spend
+        cap and the ledger are the ones this session already has. The
+        session id is derived rather than reused verbatim, so the two
+        record streams stay tellable apart while still naming a common
+        parent.
+        """
+        return RefundSession(
+            self.policy,
+            session_id=f"{self.session_id}/{suffix}",
+            composition=self.emitter.composition,
+            mode=self.emitter.mode,
+            tools=self.tools,
+            budget=self.budget,
+            acs=self.acs,
+        )
+
     async def startup(self, tool_names: list[str]) -> Guarded:
         ctx = self.builder.agent_startup(tools_registered=tool_names)
         return await self._emit(ctx)
 
     async def handle_input(self, content: str) -> Guarded:
         ctx = self.builder.input(content=content)
-        return await self._emit(ctx)
+        guarded = await self._emit(ctx)
+        if not guarded.proceeded:
+            # A blocked turn is over. Without this the deny is only a
+            # verdict about one emission, and the loop happily calls a
+            # tool on behalf of the input that was just refused.
+            self._turn_blocked = True
+        return guarded
+
+    def begin_turn(self) -> None:
+        self._turn_blocked = False
+
+    @property
+    def turn_blocked(self) -> bool:
+        return self._turn_blocked
 
     async def call_tool(self, call_id: str, name: str, args: dict[str, Any]) -> Guarded:
+        if self._turn_blocked:
+            raise TurnBlocked(self.session_id)
         ctx = self.builder.pre_tool_call(call_id=call_id, name=name, args=args)
         guarded = await self._emit(ctx)
         if not guarded.proceeded:
@@ -167,6 +218,8 @@ class RefundSession:
         return Guarded(proceeded=True, record=guarded.record, value=value)
 
     async def reply(self, content: str) -> Guarded:
+        if self._turn_blocked:
+            raise TurnBlocked(self.session_id)
         ctx = self.builder.output(content=content)
         guarded = await self._emit(ctx)
         if not guarded.proceeded:

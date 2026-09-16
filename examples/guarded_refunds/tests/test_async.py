@@ -1,14 +1,21 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
-"""Async behaviour: what GIL release does and does not buy you.
+"""Async behaviour: event-loop occupancy, timeouts and capacity.
 
-``ActivatedPolicy.evaluate`` releases the GIL. That lets other *threads*
-run. It does not free the event-loop thread that is executing the call,
-and the emitter's timeout only reaches an awaitable return. The
-difference is measurable, so these tests measure it.
+``ActivatedPolicy.evaluate`` is synchronous. Calling it from a coroutine
+occupies the event-loop thread for its full duration, and the emitter's
+timeout cannot preempt it, because only an awaitable return is
+preemptible. Offloading to a worker thread fixes both. That is what
+these tests measure.
 
-Timings are deliberately coarse -- a 300 ms stub against a 5 ms tick --
-so the assertions describe behaviour rather than machine speed.
+What they do *not* measure is native GIL release. The latency here is a
+``time.sleep`` inside the Python annotator stub, and ``time.sleep``
+releases the GIL by itself, so these assertions would pass against a
+policy that never entered the engine at all. They are about where the
+call runs, not about what the engine does while it runs.
+
+Timings are deliberately coarse, a 300 ms stub against a 5 ms tick, so
+the assertions describe behaviour rather than machine speed.
 """
 
 from __future__ import annotations
@@ -156,3 +163,56 @@ async def test_concurrent_sessions_share_one_activation(policy):
     # Each session keeps its own sequence numbering.
     assert {guarded.record.sequence for guarded in results} == {0}
     assert len({guarded.record.session_id for guarded in results}) == 4
+
+
+@pytest.mark.asyncio
+async def test_a_child_session_shares_the_cap_it_inherits(policy):
+    """Required controls have to survive work that continues elsewhere.
+
+    A child task needs its own emitter and builder, because those hold
+    per-emission state. It must not get its own budget: ``for_child_task``
+    keeps the activation, the controls and the tools, so one logical
+    session has one cap however many emitters it spans.
+    """
+    parent = RefundSession(policy, session_id="parent", budget_cap=120.0)
+    child = parent.for_child_task(suffix="background")
+
+    assert child.budget is parent.budget
+    assert child.tools is parent.tools
+
+    first = await parent.call_tool(
+        "c1",
+        "issue_refund",
+        {"order_id": "A-1001", "amount": 80.0, "reason": "damaged"},
+    )
+    second = await child.call_tool(
+        "c2", "issue_refund", {"order_id": "A-1003", "amount": 80.0, "reason": "late"}
+    )
+
+    assert first.proceeded
+    assert not second.proceeded
+    assert second.reason == "refund_budget_exceeded"
+    assert parent.tools.ledger.total == 80.0
+    # Separate record streams, both naming the same parent session.
+    assert child.session_id == "parent/background"
+
+
+@pytest.mark.asyncio
+async def test_rebuilding_a_session_instead_would_hand_out_a_second_budget(policy):
+    """Why ``for_child_task`` exists, shown by doing it the wrong way."""
+    parent = RefundSession(policy, session_id="parent", budget_cap=120.0)
+    rebuilt = RefundSession(policy, session_id="parent", budget_cap=120.0)
+
+    await parent.call_tool(
+        "c1",
+        "issue_refund",
+        {"order_id": "A-1001", "amount": 80.0, "reason": "damaged"},
+    )
+    escaped = await rebuilt.call_tool(
+        "c2", "issue_refund", {"order_id": "A-1003", "amount": 80.0, "reason": "late"}
+    )
+
+    assert escaped.proceeded
+    assert (
+        parent.budget.committed + rebuilt.budget.committed == 160.0
+    )  # over one 120 cap

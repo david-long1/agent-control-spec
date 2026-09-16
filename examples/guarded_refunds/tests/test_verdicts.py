@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import pytest
 from agent_hooks import Decision
-from app.host import RefundSession
+from app.host import RefundSession, TurnBlocked
 
 
 @pytest.mark.asyncio
@@ -70,7 +70,13 @@ async def test_transform_reaches_the_tool_not_just_the_record(policy):
 
 
 @pytest.mark.asyncio
-async def test_input_deny_stops_the_turn(policy):
+async def test_input_deny_ends_the_turn_rather_than_only_recording_it(policy):
+    """A refused turn has to stay refused.
+
+    Without host-side turn state the deny is a verdict about one
+    emission, and the loop goes on to call a tool for the input it just
+    refused.
+    """
     session = RefundSession(policy, session_id="input-deny")
 
     guarded = await session.handle_input(
@@ -79,6 +85,15 @@ async def test_input_deny_stops_the_turn(policy):
 
     assert not guarded.proceeded
     assert guarded.reason == "prompt_injection"
+    assert session.turn_blocked
+
+    with pytest.raises(TurnBlocked):
+        await session.call_tool(
+            "c1",
+            "issue_refund",
+            {"order_id": "A-1001", "amount": 40.0, "reason": "damaged"},
+        )
+    assert session.tools.ledger.entries == []
 
 
 @pytest.mark.asyncio

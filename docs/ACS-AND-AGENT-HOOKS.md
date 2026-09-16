@@ -108,7 +108,7 @@ a closed set, and no returned verdict can influence it.
 | Profile | Dispatch | Combined verdict |
 | --- | --- | --- |
 | `sequential/first_deny` | in order, transforms fold through | first deny short-circuits |
-| `sequential/run_all` | in order, transforms fold through, nothing short-circuits | severity maximum |
+| `sequential/run_all` | in order, transforms fold through | severity maximum; only a transform that fails to apply short-circuits |
 | `parallel/strictest` | each control gets the same untransformed snapshot | severity maximum |
 | `parallel/unanimous` | isolated snapshots | allow only if all allowed |
 
@@ -122,6 +122,14 @@ budget control sees the original 150 and denies. Same controls, same
 request, opposite result, so pick the profile deliberately. Fold-through
 is right when a later control should judge what will actually happen.
 Isolation is right when controls must not be able to soften each other.
+
+`run_all` runs every control, with one exception worth knowing: a
+transform that cannot be applied is a host error, and both sequential
+profiles stop there. A control registered after the one that produced
+the bad transform does not run. So `run_all` is much stronger than
+`first_deny` for mandatory controls without being an absolute guarantee
+that everything was consulted; read `verdicts[]` on the record if you
+need to know.
 
 The default is `sequential/first_deny` with `on_approval: stop`. It is a
 reasonable default and a poor fit for mandatory controls, for the reason
@@ -139,8 +147,16 @@ When the seam gets consulted depends on the profile:
   deny is liftable.
 - `sequential/run_all` and the parallel profiles run every control
   first, then consult at most once, and only when the aggregate winner
-  is liftable. A plain deny from any control wins outright and is never
-  offered for approval.
+  is liftable.
+
+Under the first two of those, a plain deny wins outright and is never
+offered for approval. `parallel/unanimous` is the exception, and it is
+easy to miss: with `on_disagreement: approval`, one control allowing and
+another denying outright is a *disagreement*, and the host synthesizes a
+liftable deny from it. An approver can then permit an action that a
+control refused. If a deny from any control has to be final, use
+`on_disagreement: deny`, which is the default. Both halves are in
+`tests/test_composition.py::test_unanimous_with_approval_can_lift_a_plain_deny`.
 
 Under `first_deny`, the `on_approval` knob decides what a lifted deny
 does to the rest of the fold. `stop` ends the emission there; `resume`
@@ -175,10 +191,12 @@ exchange for a weak security story.
 
 ## Scope, when the manifest does not cover everything
 
-A host emits all eight interception points. An ACS manifest binds
-whichever it declares, and denies the rest with
-`runtime_error:intervention_point_unknown`. Since `agent_startup` is
-emitted first, a partial manifest stops the run immediately.
+A host emits the interception points its capabilities cover, and a host
+with a tool loop emits the full set. An ACS manifest binds whichever it
+declares and denies the rest with
+`runtime_error:intervention_point_unknown`. Since `agent_startup` comes
+first, a partial manifest under an unscoped ACS control stops the run
+immediately.
 
 Bind all eight points if you want one policy answer everywhere.
 Otherwise scope the control explicitly:
@@ -218,9 +236,12 @@ closed rather than passing everything, so a deliberate passthrough has
 to be an explicitly registered allow-all.
 
 If you want a control's failure to be survivable, say so in the
-configuration, by giving it its own timeout or running it in a profile
-where a single deny does not decide, rather than by wrapping it in a
-bare `except`.
+configuration rather than by wrapping it in a bare `except`. Note that
+`register()` takes an interceptor and a name and nothing else: the
+`timeout` is one emitter-wide setting, so "give the flaky control a
+looser deadline" is not something the published API offers. What you can
+choose is the profile, and whether that control's deny decides the
+emission.
 
 ## Enforce, evaluate-only, and what a record is
 
@@ -241,6 +262,13 @@ identities, but not the content that was governed:
  'identity_provider': 'jcs-sha256',
  'composition': {'profile': 'sequential/run_all'}}
 ```
+
+One caveat on "payload-free". The record drops the context and a
+transform's value, but `reason`, `message` and any warnings are strings
+the *policy* wrote. Nothing stops a rule from interpolating the governed
+text into a message, and it would then travel to every sink. Keep policy
+metadata payload-free at the source; the record's guarantee is about the
+projection, not about what your rules put in it.
 
 That buffer is not an audit log. `set_max_records` drops the **oldest**
 record when the bound is reached and increments `records_dropped`, and a
@@ -264,12 +292,20 @@ The activated policy is immutable and shared. The emitter is not.
 An emitter holds the record buffer and the composition in effect, and
 the context builder owns the sequence counter, so both are per session.
 Work that continues in a child task, a worker thread or a subprocess
-needs its own emitter and builder, built from the same activation with
-the same session identity and the same registered controls. Otherwise
-the required controls simply do not exist on that path, and the trusted
-context that made the parent's decisions correct does not travel with
-it. Sharing one emitter across everything interleaves sequence numbers
-and record buffers between unrelated emissions.
+needs its own emitter and builder. Sharing one emitter across everything
+interleaves sequence numbers and record buffers between unrelated
+emissions.
+
+What the child must *not* get is its own copy of the controls. Rebuild a
+stateful control and you have handed the child a second full budget, a
+second rate limit, a second counter, and the limit you thought you had
+is now per emitter rather than per session. Pass the same control
+instances through, along with the same activation, and make them safe to
+call from more than one place. The example does this in
+`RefundSession.for_child_task`, and
+`tests/test_async.py::test_rebuilding_a_session_instead_would_hand_out_a_second_budget`
+shows what the careless version costs: 160 refunded against a cap of
+120.
 
 The annotator dispatcher is bound at activation, so it is shared by
 every caller of that activation and has to tolerate concurrent calls.

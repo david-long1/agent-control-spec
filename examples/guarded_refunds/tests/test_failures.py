@@ -160,3 +160,36 @@ async def test_a_transform_cannot_invent_a_missing_field(policy):
 
     assert not guarded.proceeded
     assert guarded.reason == HostError.TRANSFORM_INVALID.value
+
+
+@pytest.mark.asyncio
+async def test_a_negative_refund_is_rejected_rather_than_credited(policy):
+    """A cap that does arithmetic on any number it is handed is not a cap."""
+    session = RefundSession(policy, session_id="negative", budget_cap=100.0)
+
+    guarded = await session.call_tool(
+        "c1",
+        "issue_refund",
+        {"order_id": "A-1001", "amount": -1000.0, "reason": "damaged"},
+    )
+
+    assert not guarded.proceeded
+    assert guarded.reason == "refund_amount_invalid"
+    assert session.budget.committed == 0.0
+    assert session.budget.remaining() == 100.0
+    assert session.tools.ledger.entries == []
+
+
+@pytest.mark.asyncio
+async def test_a_non_numeric_amount_is_rejected(policy):
+    session = RefundSession(policy, session_id="nonnumeric", budget_cap=100.0)
+
+    guarded = await session.call_tool(
+        "c1",
+        "issue_refund",
+        {"order_id": "A-1001", "amount": "lots", "reason": "damaged"},
+    )
+
+    assert not guarded.proceeded
+    assert guarded.reason == "refund_amount_invalid"
+    assert session.tools.ledger.entries == []

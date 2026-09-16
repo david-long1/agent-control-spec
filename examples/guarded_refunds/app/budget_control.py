@@ -23,6 +23,8 @@ means the cap is applied to the amount that will actually be spent.
 
 from __future__ import annotations
 
+import math
+import threading
 from collections.abc import Mapping
 from typing import Any
 
@@ -30,16 +32,24 @@ from agent_hooks import Verdict
 
 
 class RefundBudgetControl:
-    """Per-session cumulative refund cap."""
+    """Cumulative refund cap for one logical session.
+
+    One instance is the cap. Child tasks, worker threads and background
+    work that belong to the same logical session must share this
+    instance, or each gets its own full budget and the cap means
+    nothing. The lock is here for that reason.
+    """
 
     def __init__(self, cap: float, *, name: str = "budget") -> None:
         self.cap = cap
         self.name = name
         self.committed = 0.0
         self.evaluated: list[float] = []
+        self._lock = threading.Lock()
 
     def remaining(self) -> float:
-        return self.cap - self.committed
+        with self._lock:
+            return self.cap - self.committed
 
     def intercept(self, context: Mapping[str, Any]) -> Verdict:
         if context["interception_point"] != "pre_tool_call":
@@ -47,13 +57,29 @@ class RefundBudgetControl:
         if (context.get("tool_call") or {}).get("name") != "issue_refund":
             return Verdict.allow()
 
-        amount = float((context.get("target") or {}).get("amount", 0.0))
-        self.evaluated.append(amount)
-        if self.committed + amount > self.cap:
+        raw = (context.get("target") or {}).get("amount")
+        try:
+            amount = float(raw)
+        except (TypeError, ValueError):
+            amount = math.nan
+
+        # A cap that accepts a negative or non-finite amount is not a
+        # cap: one negative "refund" would hand back capacity for real
+        # ones. Reject the value rather than arithmetic on it.
+        if not math.isfinite(amount) or amount <= 0:
+            return Verdict.deny(
+                reason="refund_amount_invalid",
+                message="A refund amount must be a finite number greater than zero.",
+            )
+
+        with self._lock:
+            committed = self.committed
+            self.evaluated.append(amount)
+        if committed + amount > self.cap:
             return Verdict.deny(
                 reason="refund_budget_exceeded",
                 message=(
-                    f"This session has committed {self.committed:.2f} of a "
+                    f"This session has committed {committed:.2f} of a "
                     f"{self.cap:.2f} refund budget; {amount:.2f} more would exceed it."
                 ),
             )
@@ -61,4 +87,7 @@ class RefundBudgetControl:
 
     def commit(self, amount: float) -> None:
         """Called by the host only after the refund actually happened."""
-        self.committed += amount
+        if not math.isfinite(amount) or amount <= 0:
+            raise ValueError(f"refusing to commit a non-positive refund: {amount!r}")
+        with self._lock:
+            self.committed += amount

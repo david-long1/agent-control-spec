@@ -16,12 +16,25 @@ from agent_hooks import (
     ApprovalResolution,
     CompositionConfig,
     Decision,
+    HostError,
     OnApproval,
+    SynthesisPolicy,
     Verdict,
 )
 from app.host import RefundSession
 
 ESCALATING_REFUND = {"order_id": "A-1002", "amount": 250.0, "reason": "late delivery"}
+
+
+class CountingControl:
+    """Allows everything, and remembers whether it was asked."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def intercept(self, context):
+        self.calls += 1
+        return Verdict.allow()
 
 
 class RecordingApprover:
@@ -229,3 +242,101 @@ async def test_the_profile_in_effect_is_on_every_record(policy):
         "on_approval": "resume",
     }
     assert guarded.record.interceptors_registered == 2
+
+
+@pytest.mark.asyncio
+async def test_run_all_still_short_circuits_when_a_transform_cannot_apply(policy):
+    """The one case where ``run_all`` does not run them all.
+
+    A transform that fails to apply is a host error, and both sequential
+    profiles stop there. A mandatory control registered after the
+    offending one does not run, so ``run_all`` alone is not a guarantee
+    that every control was consulted.
+    """
+
+    class AddsAMissingKey:
+        def intercept(self, context):
+            if context["interception_point"] != "pre_tool_call":
+                return Verdict.allow()
+            return Verdict.from_wire(
+                {
+                    "decision": "transform",
+                    "reason": "force_dry_run",
+                    "transform": {"path": "$target.dry_run", "value": True},
+                }
+            )
+
+    session = RefundSession(
+        policy,
+        session_id="bad-transform",
+        composition=CompositionConfig.run_all(),
+        extra_controls=[("dry", AddsAMissingKey())],
+    )
+    # Registered last, so it only runs if the fold reaches it.
+    late = CountingControl()
+    session.emitter.register(late, "late")
+
+    guarded = await session.call_tool(
+        "c1",
+        "issue_refund",
+        {"order_id": "A-1001", "amount": 40.0, "reason": "damaged"},
+    )
+
+    assert not guarded.proceeded
+    assert guarded.reason == HostError.TRANSFORM_INVALID.value
+    assert late.calls == 0
+    assert session.tools.ledger.entries == []
+
+
+@pytest.mark.asyncio
+async def test_unanimous_with_approval_can_lift_a_plain_deny(policy):
+    """Approval eligibility is not only about liftable verdicts.
+
+    Under ``parallel/unanimous`` with ``on_disagreement: approval``, an
+    allow next to a plain deny is a disagreement, and the host
+    *synthesizes* a liftable deny from it. An approver can then permit
+    an action that a control denied outright. Use
+    ``on_disagreement: deny`` where a deny must be final.
+    """
+
+    class AlwaysDenies:
+        def intercept(self, context):
+            return Verdict.deny(reason="hard_deny")
+
+    approver = RecordingApprover()
+    session = RefundSession(
+        policy,
+        session_id="unanimous",
+        composition=CompositionConfig.unanimous(
+            on_disagreement=SynthesisPolicy.APPROVAL
+        ),
+        resolver=approver,
+        extra_controls=[("strict", AlwaysDenies())],
+    )
+
+    guarded = await session.call_tool(
+        "c1",
+        "issue_refund",
+        {"order_id": "A-1001", "amount": 40.0, "reason": "damaged"},
+    )
+
+    assert guarded.proceeded
+    assert guarded.record.resolved_by == "approval"
+    assert approver.requests == ["pre_tool_call"]
+    assert session.tools.ledger.total == 40.0
+
+    # The same disagreement with the other knob is simply a deny.
+    strict_session = RefundSession(
+        policy,
+        session_id="unanimous-deny",
+        composition=CompositionConfig.unanimous(on_disagreement=SynthesisPolicy.DENY),
+        resolver=RecordingApprover(),
+        extra_controls=[("strict", AlwaysDenies())],
+    )
+    blocked = await strict_session.call_tool(
+        "c1",
+        "issue_refund",
+        {"order_id": "A-1001", "amount": 40.0, "reason": "damaged"},
+    )
+    assert not blocked.proceeded
+    assert strict_session.tools.ledger.entries == []

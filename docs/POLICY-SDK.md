@@ -1,9 +1,10 @@
 # The ACS policy and evaluation SDK
 
 ACS is a policy decision runtime. You give it a manifest, hand it one
-agent context at a time, and get back a verdict. It never calls a tool,
-never calls a model, and never writes an audit record, so it can be
-dropped into a host without taking anything over.
+agent context at a time, and get back a verdict. It never calls your
+tools, never applies its own transforms, and never writes an audit
+record, so it can be dropped into a host without taking anything over.
+It does make one kind of outbound call, covered under annotators below.
 
 This guide covers the Python binding, because Python is where the
 runnable example lives. The runtime is the same engine behind the Node
@@ -70,10 +71,18 @@ verdict = policy.evaluate("pre_tool_call", context)
 ```
 
 Activation reads the manifest, loads the Rego bundle and compiles the
-entrypoint each bound point queries. Evaluation after that costs no
-file I/O and no compilation. Do the activation at startup, off the
-serving path, and keep the instance: it is immutable, and one instance
-serves concurrent callers.
+entrypoint each bound point queries, so evaluation after that normally
+costs no file I/O and no compilation. Do it at startup, off the serving
+path, and keep the instance: it is immutable, and one instance serves
+concurrent callers.
+
+Activation succeeding is not proof that readying finished. Compilation
+is bounded by the eval timeout (`ACS_OPA_TIMEOUT_MS`, five seconds by
+default). A policy too slow to compile inside that window activates
+anyway and pays compilation on its first decision instead, which is
+where a broken bundle then surfaces as a fail-closed deny. If you need
+to know a version is good before it serves traffic, evaluate one canary
+context and check the verdict.
 
 Editing the policy on disk changes nothing until you activate again.
 That is the intended behaviour rather than a caching bug. The host
@@ -169,11 +178,25 @@ your integration more robust. It converts every genuine failure into a
 silent pass, and because the failures already arrived as denies, the
 only thing that clause can catch is your own bug.
 
-## Annotators are where the I/O goes
+## Annotators are where the I/O happens
 
-The runtime performs no I/O of its own. Anything that needs the network
-(a content classifier, an LLM judge, a lookup) is an annotator, and the
-host supplies the dispatcher:
+Anything that needs the network (a content classifier, an LLM judge, a
+lookup) is an annotator. Who makes that call depends on how you
+configure it, and the default is not what people assume.
+
+**The engine ships bundled dispatchers.** With no
+`annotator_dispatcher` supplied, a manifest that declares an `endpoint`
+or `llm` annotator has its request made by the engine, inside
+`evaluate`. Pointed at a local HTTP server, a zero-config activation
+produced one outbound POST per evaluation. There are bundled providers
+for Azure Content Safety, OpenAI moderation, Perspective, Llama Guard
+and Lakera Guard, each with its own `timeout_ms` defaulting to one
+second. So "the runtime performs no I/O" is true of the policy
+evaluation itself and false of the annotation step it drives.
+
+**Supplying a dispatcher takes that over.** The host then owns the
+call, and with it the credentials, the cache, the retries and the
+timeout:
 
 ```python
 class MyAnnotators:
@@ -192,9 +215,11 @@ policy then names as a transform value.
 Two things to hold on to. Annotators run only where a manifest point
 *asks* for them, so eight bound points do not imply eight classifier
 calls. And a dispatcher that raises does not silently no-op: the
-evaluation denies with `runtime_error:annotation_failed`. Timeouts,
-retries and caching belong in the dispatcher, because that is the only
-place that knows what it is calling.
+evaluation denies with `runtime_error:annotation_failed`.
+
+If it matters to you that an evaluation makes no network call at all,
+that is a property of the manifest plus the dispatcher you supply, not
+a property of the runtime. Review the `annotators` block.
 
 ## Threads and event loops
 
@@ -252,7 +277,7 @@ python examples/guarded_refunds/app/demo.py
 pytest examples/guarded_refunds/tests
 ```
 
-40 tests, about two seconds. They assert what the agent did rather than
+46 tests, about two seconds. They assert what the agent did rather than
 what the verdict said. The deny tests check that the refund ledger is
 empty, and the transform test checks that the tool was called with the
 capped amount.
