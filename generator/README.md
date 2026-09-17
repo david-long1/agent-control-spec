@@ -20,19 +20,19 @@ From the repository root, in a virtual environment:
 
 ```bash
 python -m pip install ./sdk/python ./generator
-opa version
 ```
 
 Building `sdk/python` requires Rust and the package's maturin build backend.
-For authoring against the published ACS dependency instead, install only
-`./generator`.
+Install both packages from this checkout. The published `agent-control-spec`
+0.4.0a3 wheel predates the new authoring helper, despite sharing the checkout's
+current version number. An older or incompatible native binding produces an
+installation error before any model call.
 
-Install the [OPA CLI](https://www.openpolicyagent.org/docs/cli) on `PATH` before
-generating. The generator uses `opa parse` to inspect Rego conditions. CI pins
-OPA 1.20.2; the tests also run with 0.70.0. ACS compiles and evaluates the resulting
-policy in process, so a host using the generated artifacts does not need OPA.
-The parser is required during authoring; missing OPA is an error before any
-model call.
+Neither generation nor runtime evaluation requires an OPA executable. The
+Python SDK exposes Regorus's in-process parser through
+`agent_control_spec.authoring`. The generator inspects that AST, and ACS uses
+Regorus to compile and evaluate the resulting policy. No parser subprocess or
+temporary Rego file is needed.
 
 ## Generate a draft
 
@@ -135,7 +135,7 @@ Rego condition statements, and optional transform effects. Unknown fields,
 duplicate JSON keys, invalid types, empty plans, and non-finite values are
 rejected rather than silently discarded.
 
-OPA parses the conditions before ACS evaluates anything. The authoring subset
+Regorus parses the conditions before ACS evaluates anything. The authoring subset
 allows request comparisons, common string and collection operations, and regex
 calls with literal patterns or variables bound to literal strings. Unsupported
 functions, network calls, external data, input overrides, dynamic annotation
@@ -144,6 +144,11 @@ Iteration uses top-level `some` statements. Comprehensions and `every` blocks ar
 outside this single-scope authoring subset, so nested bindings cannot be mistaken
 for a regex's literal pattern.
 This is a bounded authoring subset, not a general Rego type checker.
+
+The native authoring helper accepts at most 64 KiB of Rego source per call and
+8 MiB of serialized AST output; Regorus's parser limits also apply. Its AST
+layout is pinned to Regorus 0.12.0 and is not an ACS interchange format.
+The generator rejects unsupported AST variants rather than skipping checks.
 
 ACS then validates the manifest and compiles the Rego bundle. The generator
 checks collected patterns with the runtime regex engine and evaluates synthetic

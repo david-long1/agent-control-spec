@@ -10,7 +10,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
-from .conditions import require_opa
+from .conditions import require_regorus_ast
 from .llm import LanguageModel
 from .manifest_builder import build_manifest, referenced_tool_names, validate_inventory
 from .output import output_lock, write_artifacts
@@ -121,7 +121,7 @@ class GenerationEngine:
         if write and out_dir is None:
             raise ValueError("out_dir is required when write is True")
         inventory = validate_inventory({} if tool_inventory is None else tool_inventory)
-        require_opa()
+        require_regorus_ast()
         guard = output_lock(Path(out_dir), force=force) if write else nullcontext(None)
         with guard as destination:
             result = self._generate(prompt, inventory)

@@ -32,6 +32,7 @@ version = "0.4.0-alpha.3"
 dependencies = [
  "agent-control-spec",
  "pyo3",
+ "regorus",
  "serde_json",
 ]
 

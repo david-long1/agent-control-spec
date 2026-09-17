@@ -1103,6 +1103,31 @@ fn default_limits(py: Python<'_>) -> PyResult<Py<PyDict>> {
     Ok(limits_defaults_map(py)?.unbind())
 }
 
+/// Parse one source string without loading files, compiling, or evaluating it.
+/// The serialized AST is Regorus-version-specific, not part of the ACS wire contract.
+#[pyfunction]
+fn parse_rego_ast(py: Python<'_>, source: &str) -> PyResult<String> {
+    if source.len() > 65_536 {
+        return Err(PyValueError::new_err(
+            "Rego authoring source exceeds 65536 bytes",
+        ));
+    }
+    let source = source.to_owned();
+    py.detach(move || {
+        let mut engine = regorus::Engine::new();
+        engine
+            .add_policy("authoring.rego".into(), source)
+            .map_err(|err| PyValueError::new_err(format!("invalid Rego source: {err}")))?;
+        let ast = engine
+            .get_ast_as_json()
+            .map_err(|err| PyRuntimeError::new_err(format!("AST serialization failed: {err}")))?;
+        if ast.len() > 8 * 1024 * 1024 {
+            return Err(PyValueError::new_err("Rego authoring AST exceeds 8 MiB"));
+        }
+        Ok(ast)
+    })
+}
+
 #[pymodule]
 fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<RuntimeHandle>()?;
@@ -1138,5 +1163,7 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(parse_manifest, m)?)?;
     m.add_function(wrap_pyfunction!(merge_manifests, m)?)?;
     m.add_function(wrap_pyfunction!(supported_manifest_versions, m)?)?;
+    m.add_function(wrap_pyfunction!(parse_rego_ast, m)?)?;
+    m.add("REGORUS_AST_VERSION", "0.12.0")?;
     Ok(())
 }

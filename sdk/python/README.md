@@ -93,6 +93,31 @@ validate_manifest_file("manifest.yaml")
 `supported_manifest_versions()` reports the grammar versions this
 engine accepts. Read it rather than hardcoding the set.
 
+## Authoring inspection
+
+This checkout adds an in-process Rego parser for Python authoring tools:
+
+```python
+from agent_control_spec.authoring import REGORUS_AST_VERSION, parse_rego_ast
+
+policies = parse_rego_ast("package example\nallow if { input.approved == true }\n")
+assert REGORUS_AST_VERSION == "0.12.0"
+module = policies[0]["ast"]
+```
+
+The helper calls Regorus's `add_policy` and `get_ast_as_json` without evaluating
+the policy, fetching imports or reading files. It releases the GIL and raises
+`ValueError` for malformed source or exceeded authoring limits. Input is capped
+at 64 KiB and serialized output at 8 MiB; Regorus's parser limits also apply.
+
+The returned structure is the pinned Regorus AST, not a stable ACS wire format.
+It is separate from the runtime API and intended for inspection rather than
+cross-SDK interchange or persistent artifacts. The generator uses it instead
+of an external OPA installation.
+
+This helper is not in the previously published 0.4.0a3 wheel. Until a new SDK
+release includes it, install the SDK from this checkout alongside the generator.
+
 Trust model: a cooperative contract, not a security boundary — the host
 is fully trusted. See the repository's SECURITY.md.
 

@@ -1,21 +1,12 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
-"""Inspect condition bodies with OPA's parser before the runtime sees them.
-
-The original AGT generator also used OPA for authoring checks. OPA is only a
-parser here; generated policies are compiled and evaluated by ACS.
-"""
+"""Inspect condition bodies with the same Regorus parser used by ACS."""
 
 from __future__ import annotations
 
-import json
-import shutil
-import subprocess
-import tempfile
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from functools import lru_cache
-from pathlib import Path
 from typing import Any
 
 
@@ -23,13 +14,20 @@ class ConditionError(ValueError):
     """A condition cannot be checked within the supported authoring subset."""
 
 
-def require_opa() -> str:
-    path = shutil.which("opa")
-    if path is None:
+def require_regorus_ast() -> Callable[[str], list[dict[str, Any]]]:
+    from agent_control_spec import _native
+
+    if getattr(_native, "REGORUS_AST_VERSION", None) != "0.12.0" or not callable(
+        getattr(_native, "parse_rego_ast", None)
+    ):
         raise RuntimeError(
-            "OPA is required for generation; install opa and put it on PATH"
+            "this generator requires ACS's Regorus 0.12.0 authoring support; "
+            "install the SDK and generator from the same checkout with "
+            "'python -m pip install ./sdk/python ./generator'"
         )
-    return path
+    from agent_control_spec.authoring import parse_rego_ast
+
+    return parse_rego_ast
 
 
 @lru_cache(maxsize=128)
@@ -37,49 +35,161 @@ def _parse(body: str) -> dict[str, Any]:
     source = (
         f"package acs_generator_conditions\nimport rego.v1\ncheck if {{\n{body}\n}}\n"
     )
+    parser = require_regorus_ast()
     try:
-        with tempfile.TemporaryDirectory(prefix="acs-conditions-") as directory:
-            path = Path(directory) / "conditions.rego"
-            path.write_text(source, encoding="utf-8")
-            result = subprocess.run(
-                [require_opa(), "parse", "--format=json", str(path)],
-                text=True,
-                encoding="utf-8",
-                capture_output=True,
-                timeout=10,
-                check=False,
-            )
-    except subprocess.TimeoutExpired:
-        raise ConditionError("condition parsing timed out") from None
-    if result.returncode:
-        raise ConditionError("invalid Rego conditions: " + result.stderr[:2000])
-    document = json.loads(result.stdout)
+        policies = parser(source)
+    except ValueError as exc:
+        raise ConditionError("invalid Rego conditions: " + str(exc)[:2000]) from exc
+    if len(policies) != 1 or policies[0].get("version") != 1:
+        raise ConditionError("unsupported Regorus AST envelope")
+    document = policies[0]["ast"]
     rules = document.get("rules", [])
+    imports = document.get("imports", [])
     if (
-        document.get("package", {}).get("path")
-        != [
-            {"type": "var", "value": "data"},
-            {"type": "string", "value": "acs_generator_conditions"},
-        ]
-        or document.get("imports")
-        != [
-            {
-                "path": {
-                    "type": "ref",
-                    "value": [
-                        {"type": "var", "value": "rego"},
-                        {"type": "string", "value": "v1"},
-                    ],
-                },
-            }
-        ]
+        _ref(_expression(document["package"]["refr"])) != ("acs_generator_conditions",)
+        or not document.get("rego_v1")
+        or len(imports) != 1
+        or "as" in imports[0]
+        or _ref(_expression(imports[0]["refr"])) != ("rego", "v1")
         or len(rules) != 1
-        or rules[0].get("head", {}).get("name") != "check"
-        or "else" in rules[0]
-        or rules[0]["head"].get("value") != {"type": "boolean", "value": True}
     ):
         raise ConditionError("conditions must be a rule body, not additional rules")
-    return rules[0]
+    rule = rules[0].get("Spec", {})
+    head = rule.get("head", {}).get("Compr", {})
+    bodies = rule.get("bodies", [])
+    if (
+        not head
+        or head.get("assign") is not None
+        or _ref(_expression(head["refr"])) != ("check",)
+        or len(bodies) != 1
+        or bodies[0].get("assign") is not None
+        or bodies[0].get("is_else")
+    ):
+        raise ConditionError("conditions must be a rule body, not additional rules")
+    return {"body": [_statement(stmt) for stmt in bodies[0]["query"]["stmts"]]}
+
+
+_OPERATORS = {
+    "AssignExpr": {"ColEq": "assign", "Eq": "eq"},
+    "BoolExpr": {
+        "Eq": "equal",
+        "Ne": "neq",
+        "Lt": "lt",
+        "Le": "lte",
+        "Gt": "gt",
+        "Ge": "gte",
+    },
+    "ArithExpr": {
+        "Add": "plus",
+        "Sub": "minus",
+        "Mul": "mul",
+        "Div": "div",
+        "Mod": "rem",
+    },
+    "BinExpr": {"Intersection": "and", "Union": "or"},
+}
+_SCALARS = {
+    "Var": "var",
+    "String": "string",
+    "RawString": "string",
+    "Number": "number",
+    "Bool": "boolean",
+    "Null": "null",
+}
+
+
+def _call(name: str, args: list[dict[str, Any]]) -> dict[str, Any]:
+    return {"type": "call", "value": [{"type": "var", "value": name}, *args]}
+
+
+def _membership(value: dict[str, Any]) -> dict[str, Any]:
+    args = [_expression(value["value"]), _expression(value["collection"])]
+    if value["key"] is not None:
+        args.insert(0, _expression(value["key"]))
+    return _call(f"internal.member_{len(args)}", args)
+
+
+def _statement(stmt: dict[str, Any]) -> dict[str, Any]:
+    if stmt.get("with_mods"):
+        raise ConditionError(
+            "conditions must not replace input or builtins with 'with'"
+        )
+    kind, value = next(iter(stmt["literal"].items()))
+    if kind in {"Expr", "NotExpr"}:
+        return {"terms": _expression(value["expr"]), "negated": kind == "NotExpr"}
+    if kind == "SomeIn":
+        return {"terms": _membership(value)}
+    if kind == "SomeVars":
+        return {"terms": {"symbols": []}}
+    if kind == "Every":
+        raise ConditionError(
+            "nested condition scopes are not supported; use top-level some"
+        )
+    raise ConditionError(f"unsupported Regorus statement '{kind}'")
+
+
+def _expression(expr: dict[str, Any]) -> dict[str, Any]:
+    """Normalize parsed expressions for the existing dependency checks.
+
+    This is not a parser or an OPA AST emulator. Only Regorus variants handled
+    explicitly here enter the inspection representation; unknown variants fail.
+    """
+    if len(expr) != 1:
+        raise ConditionError("unsupported Regorus expression shape")
+    kind, value = next(iter(expr.items()))
+    if kind in _SCALARS:
+        term = {"type": _SCALARS[kind], "value": value["value"]}
+        if kind == "Var" and value["value"] in {"input", "data"}:
+            return {"type": "ref", "value": [term]}
+        return term
+    if kind in {"Array", "Set"}:
+        return {
+            "type": kind.lower(),
+            "value": [_expression(item) for item in value["items"]],
+        }
+    if kind == "Object":
+        return {
+            "type": "object",
+            "value": [
+                [_expression(key), _expression(item)]
+                for _span, key, item in value["fields"]
+            ],
+        }
+    if kind in {"ArrayCompr", "SetCompr", "ObjectCompr"}:
+        raise ConditionError(
+            "nested condition scopes are not supported; use top-level some"
+        )
+    if kind in {"RefDot", "RefBrack"}:
+        base = _expression(value["refr"])
+        parts = base["value"] if base["type"] == "ref" else [base]
+        index = (
+            _expression(value["index"])
+            if kind == "RefBrack"
+            else {"type": "string", "value": value["field"][1]}
+        )
+        return {"type": "ref", "value": [*parts, index]}
+    if kind == "Call":
+        return {
+            "type": "call",
+            "value": [
+                _expression(value["fcn"]),
+                *(_expression(arg) for arg in value["params"]),
+            ],
+        }
+    if kind in _OPERATORS:
+        operator = _OPERATORS[kind].get(value["op"])
+        if operator is None:
+            raise ConditionError(f"unsupported Regorus operator '{value['op']}'")
+        return _call(operator, [_expression(value["lhs"]), _expression(value["rhs"])])
+    if kind == "Membership":
+        return _membership(value)
+    if kind == "UnaryExpr":
+        # Regorus represents unary numeric negation explicitly, including on
+        # variables. Preserve the operand so nested references/calls are checked.
+        return _call(
+            "minus", [{"type": "number", "value": 0}, _expression(value["expr"])]
+        )
+    raise ConditionError(f"unsupported Regorus expression '{kind}'")
 
 
 def _walk(node: Any) -> Iterator[dict[str, Any]]:

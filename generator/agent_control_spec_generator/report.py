@@ -22,7 +22,7 @@ def build_report(
         "",
         "## Checks performed",
         "",
-        "- OPA parsed the condition bodies and the generator checked supported references and functions.",
+        "- Regorus parsed the condition bodies in process; the generator checked supported references and functions.",
         "- ACS validated the manifest and compiled its in-memory Rego bundle.",
         "- The runtime regex engine accepted the collected patterns.",
         "- ACS accepted each transform path's grammar, independent of rule matching.",
