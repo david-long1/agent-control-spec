@@ -1,201 +1,195 @@
-# ACS policy generator
+# Natural-language policy authoring
 
-Describe an agent in prose and get an ACS manifest and a Rego policy back.
+`acs-policy-gen` takes an agent description, system prompt, or policy statement
+and asks a model for a JSON policy plan. It renders the plan as an ACS manifest,
+Rego module, and review report. The output is a draft. Review the rules and test
+them against your application's inputs before activating the policy.
 
-The caller supplies a system prompt, a plain description of the agent, a
-statement of the policy, or any mixture of the three. A language model turns
-that into a constrained policy plan. The generator compiles the plan into
-artifacts and validates them with `agent_control_spec`, the engine that will
-evaluate them at runtime. Nothing is written until validation passes.
+This is a port of AGT's `acs-generate --prompt` flow from
+[`policy-engine/generator/` at `c63c51e8`](https://github.com/microsoft/agent-governance-toolkit/tree/c63c51e881c442fbc060705f7e211f29993f2c1b/policy-engine/generator).
+The guided `acs-generate init` designer is not included. The distribution
+`agent-control-spec-generator` and command `acs-policy-gen` have different names
+so they can coexist with AGT's generator.
 
-## The output is a draft
+## Install from this checkout
 
-A model wrote the rules. The engine checked that they load, compile, and
-return a verdict rather than a fail closed error. No check here establishes
-that the policy says what the prose asked for, or that a regular expression
-matches the text a reviewer had in mind, or that a guardrail the prose
-implied but never stated made it into a rule at all. Read `report.md`, then
-read every rule, before binding the policy to an agent.
+The generator is a separate Python package. It is not part of the ACS runtime
+wheel, and this change does not publish it to PyPI.
 
-## Install
+From the repository root, in a virtual environment:
 
 ```bash
-pip install ./generator
+python -m pip install ./sdk/python ./generator
+opa version
 ```
 
-The engine comes with it. `agent-control-spec` is a dependency, so the
-validator and the runtime the artifacts target are the same build.
+Building `sdk/python` requires Rust and the package's maturin build backend.
+For authoring against the published ACS dependency instead, install only
+`./generator`.
 
-## Generate
+Install the [OPA CLI](https://www.openpolicyagent.org/docs/cli) on `PATH` before
+generating. The generator uses `opa parse` to inspect Rego conditions. CI pins
+OPA 1.20.2; the tests also run with 0.70.0. ACS compiles and evaluates the resulting
+policy in process, so a host using the generated artifacts does not need OPA.
+The parser is required during authoring; missing OPA is an error before any
+model call.
+
+## Generate a draft
 
 ```bash
 export ACS_GENERATOR_API_KEY="..."
+export ACS_GENERATOR_MODEL="your-model-or-deployment"
 
 acs-policy-gen \
-  --prompt "Retail banking assistant. Block passwords in prompts, require a
-            human to approve wire transfers above 10000, and mask account
-            numbers in the final answer." \
-  --tool wire_transfer:banking,payments \
-  --out build/payments
+  --prompt "A support assistant. At output, redact account numbers matching
+            acct_[0-9]+ from target.content. Do not use annotators." \
+  --out build/support-policy
 ```
 
-That writes three files.
+The directory contains:
 
-| Path | Contents |
+| File | Contents |
 | --- | --- |
-| `manifest.yaml` | The ACS manifest, naming the guarded intervention points, the tool catalog, the annotators, and the bound policy |
-| `policy/<slug>.rego` | One Rego module with an entrypoint per guarded point |
-| `report.md` | What was assumed, what the engine checked, and what no check established |
+| `manifest.yaml` | Bound interception points, tool catalog, annotator declarations, and policy queries |
+| `policy/<slug>.rego` | One module with point-specific entrypoints |
+| `report.md` | Rules, assumptions, checks performed, and review limitations |
 
-Add `--dry-run` to print the artifacts instead of writing them. The output
-directory must be empty, including on a second run over an earlier one. Pass
-`--force` to replace what is there.
+Use `--prompt-file FILE` for a system prompt or policy document.
+`--prompt-file -` reads stdin. `--dry-run` still calls the model and validates its
+response, but prints the artifacts without writing them.
 
-## Inputs
-
-| Input | How it is supplied |
-| --- | --- |
-| Guardrail prose | `--prompt`, or `--prompt-file FILE`, or `--prompt-file -` to read stdin |
-| Tool inventory | `--tool NAME:LABEL,LABEL`, repeatable, and `--tools-file FILE` holding a JSON or YAML mapping of tool name to catalog entry |
-| Output directory | `--out DIR` |
-
-A tool the policy gates on should appear in the inventory. Every tool you
-supply reaches the manifest catalog, whether or not a rule mentions it,
-because a tool missing from the catalog fails closed with
-`runtime_error:tool_unknown` on every call to it. Keeping only the referenced
-ones would brick the rest of the agent's tools the moment a tool point is
-guarded. A name that only a rule mentions is recovered and added with minimal
-metadata, and that is reported as a warning.
-
-## Configuration
-
-Every provider setting has a flag and an environment variable. The
-environment variable is the better place for the key, which keeps it out of
-shell history and out of process listings.
-
-| Flag | Variable | Default | Meaning |
-| --- | --- | --- | --- |
-| `--api-key` | `ACS_GENERATOR_API_KEY` | none | Provider credential. Required |
-| `--api-base` | `ACS_GENERATOR_API_BASE` | `https://api.openai.com/v1` | Chat completions base URL |
-| `--model` | `ACS_GENERATOR_MODEL` | `gpt-4o-mini` | Model or Azure deployment name |
-| `--api-version` | `ACS_GENERATOR_API_VERSION` | none | Azure OpenAI api-version. Setting it selects Azure `api-key` auth |
-| `--max-attempts` | none | 5 | Model calls per generation, one per repair round |
-
-Azure mode is also selected by an `*.azure.com` API base. It changes the
-auth header and appends the api-version query string.
-
-A key is read only when a generation runs. Importing the package contacts
-nothing and reads no credential, so a test suite or a CI job can import it
-freely.
-
-### Call budget
-
-One generation costs between one and `--max-attempts` model calls. The first
-call produces a plan. Each rejection sends the engine's own diagnostic back
-for repair, and every attempt failing raises an error and writes nothing.
-
-## What the generator checks
-
-Validation runs against the engine, not against a copy of its rules.
-
-- The manifest validates under the engine's manifest grammar, at the version
-  the installed engine reports rather than a version pinned here.
-- The Rego module compiles under the engine that will evaluate it. Rego is
-  compiled in process, so there is no external validator to install and no
-  path that silently skips this.
-- Every redact pattern, and every regular expression a rule condition passes
-  to a Rego builtin, compiles under the engine's own regular expression
-  engine. These catch a failure that is otherwise invisible. An invalid
-  pattern leaves the manifest valid and the module compiling, and at
-  evaluation the builtin call goes undefined, the rule body fails, and the
-  default `allow` answers. The rule reads exactly as authored and does
-  nothing.
-- Every guarded intervention point is evaluated against a well formed
-  agent-hooks context and must return a policy verdict rather than a
-  `runtime_error:*` fail closed deny. That catches an unresolvable policy
-  target, an annotator bound to nothing, and a tool the catalog cannot
-  project.
-
-The plan gate refuses several shapes before compilation, each because the
-engine would otherwise accept the artifact and enforce less than it appears
-to.
-
-| Refused | Why |
-| --- | --- |
-| A rule with no condition, or gated only by a tautology such as `true` | It fires on every request at its point |
-| A reason in the reserved `runtime_error:` namespace | The engine rejects it at evaluation |
-| A redaction rooted at bare `$target` where the target is an object | The `is_string` guard never holds, so the rule never fires |
-| A transform carrying no effect | It would replace the value with itself and report a rewrite |
-| Two transform rules at one point | Rules at a point are one else-chain, so only the first match runs |
-| A transform path naming a member the target does not have | Resolving the path is a host obligation, so it fails at the host, not here |
-| `$target.value` | The policy target already is the value |
-| A transform at `agent_startup` or `agent_shutdown` | Forbidden by AGENT-HOOKS-0.1 section 4.3, and the engine will not catch it, because rejecting it is the host's obligation |
-
-Where the predecessor silently repaired a path it did not recognize by
-resetting it to the root, this rejects instead, which turns a typo into a
-repair round rather than into a whole-value replacement.
-
-## Python API
+The same inputs are available through Python:
 
 ```python
 from pathlib import Path
 
-from agent_control_spec_generator import GenerationEngine
-from agent_control_spec_generator.llm import OpenAICompatibleLanguageModel
+from agent_control_spec_generator import GenerationEngine, OpenAICompatibleLanguageModel
 
-result = GenerationEngine(OpenAICompatibleLanguageModel()).generate(
-    prompt=Path("guardrails.md").read_text(encoding="utf-8"),
-    out_dir=Path("build/payments"),
-    tool_inventory={"wire_transfer": {"type": "Tool", "clearance": "confidential"}},
+result = GenerationEngine(OpenAICompatibleLanguageModel(), max_attempts=3).generate(
+    prompt=Path("guardrails.txt").read_text(encoding="utf-8"),
+    out_dir=Path("build/support-policy"),
+    tool_inventory={"lookup": {"clearance": "internal"}},
 )
-
-print(result.slug, result.attempts, result.warnings)
+print(result.attempts, result.warnings)
 ```
 
-`generate` returns the slug, the manifest as both a dict and YAML, the Rego
-source, the report, the warnings, and the number of model calls it took.
-Pass `write=False` to get the artifacts without touching disk.
+`GenerationResult` contains the manifest dict and YAML text, Rego source, report,
+warnings, slug, and attempt count. Pass `write=False` to keep the artifacts in
+memory. A custom model only needs `complete(system, user) -> str`.
 
-Any object with a `complete(system, user) -> str` method is a model, so an
-internal deployment or a recorded transcript substitutes for the bundled
-provider. `StubLanguageModel` is the scripted one the tests and the example
-use.
+## Provider configuration
 
-## Example
+| Flag | Environment variable | Default |
+| --- | --- | --- |
+| `--api-base` | `ACS_GENERATOR_API_BASE` | `https://api.openai.com/v1` |
+| `--api-key` | `ACS_GENERATOR_API_KEY` | Required |
+| `--model` | `ACS_GENERATOR_MODEL` | `gpt-4o-mini` |
+| `--api-version` | `ACS_GENERATOR_API_VERSION` | Unset |
+| `--max-attempts` | None | 5, with an allowed range of 1 through 5 |
 
-`examples/payments_agent.py` generates a payments policy from prose and then
-enforces it, evaluating real agent-hooks contexts through
-`agent_control_spec`. It contacts nothing, because the model is scripted.
+Prefer the environment variable over `--api-key` to keep credentials out of
+shell history. The provider receives the authoring instructions, supplied prose,
+tool inventory, and any rejected plan and repair diagnostic. Do not supply
+secrets or customer data unless that endpoint is approved to receive them.
+
+For Azure deployment chat completions, set the resource root as `--api-base`,
+the deployment name as `--model`, and `--api-version`. An explicit
+`/openai/deployments/NAME` base is also accepted. Without `--api-version`, an Azure
+resource root uses `/openai/v1`; a caller-supplied v1 base is used as written.
+Azure requests use `api-key`; other v1 requests use bearer authorization.
+
+Requests require HTTPS, except for loopback test servers. Redirects are refused.
+Each request has a 60-second transport timeout, a 4,096-completion-token budget,
+and a 1 MB response limit. The timeout is a socket-operation timeout, not a total
+generation deadline. Sampling is left to the provider; generation is not
+deterministic.
+
+A rejected plan gets another attempt with the previous response and diagnostic.
+Provider failures, refusals, truncated responses, missing credentials, and write
+errors stop the operation. They do not consume policy repair attempts. Provider
+response bodies are omitted from errors.
+
+## Tools and annotators
+
+Supply the complete tool catalog with `--tools-file FILE`, a JSON or YAML mapping
+of tool names to objects. `--tool NAME:LABEL,LABEL` adds a tool with security labels;
+use a tools file for `clearance` or other host metadata. The Python equivalent is
+`tool_inventory`.
+
+The generator preserves supplied entries, adds missing `id` and `name` members,
+and reports tool names inferred from conditions without inventory metadata.
+When a catalog is present, tool points project the named entry into `input.tool`.
+An unknown tool is denied by ACS. Without a catalog, rules may inspect tool
+arguments, but rules that require `input.tool` are rejected.
+
+Annotator references produce manifest bindings, including references through
+simple aliases and quoted keys. Undeclared references receive a classifier
+declaration and a warning. The host must provide and configure that dispatcher;
+generation does not implement a classifier or call an annotator service.
+
+## Supported plans and review limits
+
+The model returns `name`, `guarded_points`, `tools`, `annotators`, `annotations`,
+`rules`, and `warnings`. Each rule has a point, decision, reason, optional message,
+Rego condition statements, and optional transform effects. Unknown fields,
+duplicate JSON keys, invalid types, empty plans, and non-finite values are
+rejected rather than silently discarded.
+
+OPA parses the conditions before ACS evaluates anything. The authoring subset
+allows request comparisons, common string and collection operations, and regex
+calls with literal patterns or variables bound to literal strings. Unsupported
+functions, network calls, external data, input overrides, dynamic annotation
+names, and unresolved regex patterns are rejected with repair diagnostics.
+This is a bounded authoring subset, not a general Rego type checker.
+
+ACS then validates the manifest and compiles the Rego bundle. The generator
+checks collected patterns with the runtime regex engine and evaluates synthetic
+contexts at every bound point. These smoke cases use empty annotation results
+and do not prove that a rule ever matches. Application-specific properties,
+regex coverage, policy completeness, and host enforcement still need tests.
+
+The default verdict is allow. Rules use a first-match chain ordered
+`deny > escalate > transform > warn > allow`, with plan order breaking ties.
+Only one rule contributes a verdict, so matching warnings are not accumulated.
+`warn` and `escalate` are policy intents that ACS normalizes to `allow` with
+warnings and `deny` with an approval block.
+
+There is at most one transform rule per point. It carries one replacement or
+multiple same-path redactions. Valid paths are preserved, including quoted keys
+and real nested members such as `$target.value`. A redact operation must target
+a string. All generated manifests read `$.target`, the agent-hooks value under
+evaluation. Lifecycle transforms are rejected.
+
+The [Python SDK](../sdk/python/README.md) can activate these files or their
+in-memory equivalents. Agent-hooks hosts apply transforms and resolve approvals;
+ACS only returns verdicts. Generation does not activate or approve a policy.
+
+## Output replacement
+
+Both the CLI and Python API require a new or empty output directory by default.
+`--force` or `force=True` permits replacement of an artifact-only directory.
+Directories containing unrelated top-level entries or symlinks are rejected.
+
+The writer stages every file first, retains the old directory as a sibling
+`.NAME.backup-...`, then publishes the new directory. A failed publication rename
+restores the previous directory. Backups are never automatically deleted.
+Replacing an existing directory uses two renames, not an atomic exchange.
+Use versioned directories and activate them after generation rather than loading
+from a directory while it is being replaced.
+
+A sibling lock rejects concurrent generator writers. An interrupted process can
+leave its lock file; remove it only after confirming the writer has stopped.
+
+## Offline example and tests
+
+From the repository root:
 
 ```bash
-python examples/payments_agent.py
+python generator/examples/payments_agent.py
+python -m pytest generator
 ```
 
-It prints each verdict the policy produces. A password in the prompt is
-denied. A large transfer comes back as a deny carrying an approval block,
-which is how an escalation is expressed. Output naming an account number
-comes back as a transform carrying the redacted text. Everything else is
-allowed.
-
-## How generated verdicts behave
-
-The generated policy may express five decisions, and the runtime normalizes
-two of them. A `warn` becomes an `allow` carrying the reason and message in
-`warnings[]`. An `escalate` becomes a `deny` carrying an `approval` block,
-which the host lifts through its approval seam. `allow`, `deny`, and
-`transform` pass through.
-
-The runtime computes verdicts and does not act on them. Applying a
-transform, honouring `evaluate_only`, and resolving an approval are host
-obligations under AGENT-HOOKS-0.1.
-
-## Tests
-
-```bash
-pip install ./generator pytest
-pytest generator
-```
-
-The suite is deterministic and offline. Every model is scripted, and the
-assertions about behavior are made by loading the generated artifacts into
-`agent_control_spec` and evaluating them.
+The example uses a scripted model and a local example annotator. It generates
+artifacts and evaluates password, transfer, and redaction cases through ACS.
+It does not execute a bank transfer or enforce a host action. Tests require no
+provider credentials; transport tests use loopback servers or recorded responses.

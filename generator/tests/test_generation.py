@@ -313,19 +313,21 @@ def test_a_rule_at_an_unguarded_point_still_guards_that_point(tmp_path):
     assert (verdict.decision.value, verdict.reason) == ("deny", "leaked")
 
 
-def test_target_dot_value_is_rejected_rather_than_silently_rewritten(tmp_path):
-    """Models append `.value`, conflating the transform root with the
-    `input.policy_target.value` read path. The predecessor reset any path it
-    did not recognise to bare `$target`, which turns a typo into a whole-value
-    replacement. Rejecting lets the repair loop fix the path instead."""
+def test_target_dot_value_preserves_a_real_nested_tool_result_member(tmp_path):
     plan = _tool_redaction_plan("$target.value")
-
-    with pytest.raises(GenerationError) as excinfo:
-        GenerationEngine(StubLanguageModel([plan]), max_attempts=1).generate(
-            prompt=PROSE, out_dir=tmp_path / "out", write=False
-        )
-
-    assert "already is the value" in str(excinfo.value)
+    generate([plan], tmp_path)
+    policy = ActivatedPolicy.activate(str(tmp_path / "out" / "manifest.yaml"))
+    verdict = policy.evaluate(
+        "post_tool_call",
+        builder().post_tool_call(
+            call_id="c",
+            name="lookup",
+            args={},
+            value={"value": "acct_4242", "other": "keep"},
+        ),
+    )
+    assert verdict.transform.path == "$target.value"
+    assert verdict.transform.value == "[REDACTED]"
 
 
 def test_a_redaction_at_the_tool_result_root_compiles_and_fires(tmp_path):
@@ -361,15 +363,14 @@ def _tool_redaction_plan(path: str) -> dict:
     )
 
 
-def test_effects_on_a_non_transform_decision_are_dropped_and_reported(tmp_path):
+def test_effects_on_a_non_transform_decision_fail_generation(tmp_path):
     plan = minimal_plan()
     plan["rules"][0]["effects"] = [
         {"type": "redact", "path": "$target.content", "pattern": "x"}
     ]
-    result, _ = generate([plan], tmp_path)
-
-    assert "regex.replace" not in result.rego
-    assert any("dropped" in warning for warning in result.warnings)
+    with pytest.raises(GenerationError, match="nothing will be dropped"):
+        generate([plan], tmp_path)
+    assert not (tmp_path / "out").exists()
 
 
 def test_a_tool_without_an_inventory_entry_is_reported(tmp_path):
@@ -600,7 +601,7 @@ def test_a_stale_policy_module_does_not_survive_regeneration(tmp_path):
     stale.write_text("package broken\n\nbroken ::= \n", encoding="utf-8")
 
     GenerationEngine(StubLanguageModel([minimal_plan(name="Second")])).generate(
-        prompt=PROSE, out_dir=out
+        prompt=PROSE, out_dir=out, force=True
     )
 
     assert not stale.exists()

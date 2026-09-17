@@ -15,9 +15,9 @@ import yaml
 
 from .engine import GenerationEngine, GenerationError
 from .llm import DEFAULT_API_BASE, DEFAULT_MODEL, OpenAICompatibleLanguageModel
+from .manifest_builder import validate_inventory
+from .output import check_output
 from .vocabulary import MAX_REPAIR_ATTEMPTS
-
-_GENERATED_FILES = ("manifest.yaml", "report.md", "policy")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -26,7 +26,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         out_dir = Path(args.out)
         if not args.dry_run:
-            _check_out_dir(out_dir, force=args.force)
+            check_output(out_dir, force=args.force)
         model = OpenAICompatibleLanguageModel(
             api_base=args.api_base,
             api_key=args.api_key,
@@ -38,8 +38,9 @@ def main(argv: list[str] | None = None) -> int:
             out_dir=out_dir,
             tool_inventory=_tool_inventory(args),
             write=not args.dry_run,
+            force=args.force,
         )
-    except (OSError, ValueError, GenerationError, RuntimeError) as exc:
+    except (OSError, ValueError, GenerationError, RuntimeError, yaml.YAMLError) as exc:
         print(f"acs-policy-gen failed: {exc}", file=sys.stderr)
         return 1
     if args.dry_run:
@@ -91,7 +92,7 @@ def _parser() -> argparse.ArgumentParser:
         action="append",
         default=[],
         metavar="NAME:LABEL,LABEL",
-        help="Tool inventory entry as name:clearance1,clearance2. Repeatable",
+        help="Tool name and security labels as name:label1,label2. Repeatable",
     )
     parser.add_argument(
         "--tools-file",
@@ -101,7 +102,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--force",
         action="store_true",
-        help="Overwrite manifest.yaml, report.md and policy/ in a non-empty output directory",
+        help="Replace an artifact-only directory, retaining the previous directory as a sibling backup",
     )
     parser.add_argument(
         "--dry-run",
@@ -140,33 +141,6 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _check_out_dir(out_dir: Path, *, force: bool) -> None:
-    """Refuse to overwrite an output directory that holds anything else.
-
-    Regenerating over a previous run is ordinary. Writing a policy into a
-    directory that already holds unrelated work is not, and `--force` is the
-    explicit way to say the generated files may be replaced.
-    """
-    if not out_dir.exists():
-        return
-    if not out_dir.is_dir():
-        raise ValueError(f"--out {out_dir} exists and is not a directory")
-    existing = sorted(entry.name for entry in out_dir.iterdir())
-    if not existing:
-        return
-    if force:
-        return
-    unexpected = [name for name in existing if name not in _GENERATED_FILES]
-    detail = (
-        "it holds files this command does not generate: " + ", ".join(unexpected)
-        if unexpected
-        else "it holds artifacts from an earlier run"
-    )
-    raise ValueError(
-        f"--out {out_dir} is not empty and {detail}. Pass --force to replace them"
-    )
-
-
 def _prompt(args: argparse.Namespace) -> str:
     if args.prompt_file == "-":
         return sys.stdin.read()
@@ -188,9 +162,7 @@ def _tool_inventory(args: argparse.Namespace) -> dict[str, dict[str, Any]]:
             raise ValueError(
                 "--tools-file must contain a mapping of tool name to entry"
             )
-        inventory.update(
-            {str(name): dict(config or {}) for name, config in loaded.items()}
-        )
+        inventory.update(validate_inventory(loaded))
     for entry in args.tool:
         name, separator, clearances = entry.partition(":")
         if not separator or not name:
@@ -201,7 +173,6 @@ def _tool_inventory(args: argparse.Namespace) -> dict[str, dict[str, Any]]:
         inventory[name] = {
             "type": "Tool",
             "id": name,
-            "clearance": labels,
             "security_labels": labels,
         }
     return inventory

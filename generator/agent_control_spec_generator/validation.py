@@ -1,29 +1,9 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
-"""Validate generated artifacts with the engine that will run them.
+"""Compile generated artifacts and run limited smoke cases through ACS.
 
-Every check here goes through `agent_control_spec`, so the authority on a
-generated artifact is the same runtime a host loads it into. The predecessor
-generator shelled out to the `opa` executable and, when it was absent,
-skipped Rego checking entirely behind a warning. The engine compiles Rego in
-process, so there is no optional external validator and no skip path.
-
-Three checks run, in increasing cost.
-
-`validate_artifacts` compiles the manifest and the Rego together and reports
-what activation would have surfaced.
-
-`check_regex_patterns` compiles every redact pattern through the engine's own
-regex engine. This one exists because an invalid pattern is otherwise
-invisible: the manifest validates, the Rego compiles, and at evaluation the
-builtin call goes undefined, the rule body fails, and the default `allow`
-answers. A redaction rule that silently stops redacting is the worst failure
-mode this generator can ship, so it is checked directly.
-
-`smoke_evaluate` activates the policy and evaluates one synthetic agent-hooks
-context per guarded point, asserting no `runtime_error:*` comes back. That
-catches an unresolvable policy target, an undeclared annotator, and an
-unprojectable tool, none of which the two static checks can see.
+Condition parsing happens before this module runs. Smoke success establishes
+neither policy completeness nor coverage of a host's actual inputs.
 """
 
 from __future__ import annotations
@@ -37,13 +17,7 @@ from agent_control_spec import ActivatedPolicy
 from agent_control_spec import validate_artifacts as _engine_validate
 from agent_hooks import AgentContextBuilder
 
-from .vocabulary import (
-    POLICY_INPUT_ANNOTATIONS_KEY,
-    POLICY_INPUT_POINT_KEY,
-    REMOVED_INPUT_REFS,
-    REMOVED_TRANSFORM_ROOT,
-    manifest_version,
-)
+from .vocabulary import manifest_version
 
 _REGEX_PROBE_PACKAGE = "acs_generator_regex_probe"
 
@@ -90,16 +64,8 @@ def validate_artifacts(
     *,
     regex_patterns: tuple[str, ...] = (),
 ) -> ValidationResult:
-    """Run every check against the generated pair. Raises `ValidationError`.
-
-    `regex_patterns` are the redact patterns the policy will compile. The
-    caller passes them because it built them, which is exact. Reading them
-    back out of the rendered Rego would mean parsing nested builtin calls,
-    and a redaction that chains two patterns renders one call inside
-    another.
-    """
+    """Compile the pair, check collected regex patterns, then smoke-evaluate."""
     warnings: list[str] = []
-    _reject_removed_refs(rego)
     _validate_with_engine(manifest_yaml, rego, slug)
     check_regex_patterns(tuple(dict.fromkeys(regex_patterns)))
     warnings.extend(smoke_evaluate(manifest, manifest_yaml, rego, slug))
@@ -118,28 +84,6 @@ def _validate_with_engine(manifest_yaml: str, rego: str, slug: str) -> None:
             + "; ".join(
                 f"{item.get('code')}: {item.get('message')}" for item in diagnostics
             )
-        )
-
-
-def _reject_removed_refs(rego: str) -> None:
-    """Refuse policy-input names the current contract removed.
-
-    A removed name does not error. It evaluates to undefined, the rule body
-    fails, and the default verdict answers, so the policy reads as written
-    and enforces nothing.
-    """
-    found = sorted({ref for ref in REMOVED_INPUT_REFS if ref in rego})
-    if found:
-        raise ValidationError(
-            "generated policy reads policy-input members the current contract "
-            f"removed ({', '.join(found)}); the five members are "
-            f"{POLICY_INPUT_POINT_KEY}, policy_target, snapshot, "
-            f"{POLICY_INPUT_ANNOTATIONS_KEY} and tool"
-        )
-    if REMOVED_TRANSFORM_ROOT in rego:
-        raise ValidationError(
-            f"generated policy uses the removed {REMOVED_TRANSFORM_ROOT} transform "
-            "root; AGENT-HOOKS-0.1 renamed it $target with no alias"
         )
 
 
@@ -228,13 +172,12 @@ def smoke_evaluate(
             _bundles(rego, slug),
             annotator_dispatcher=_NullAnnotator(),
         )
-    except Exception as exc:
+    except (RuntimeError, ValueError) as exc:
         raise ValidationError(f"generated policy failed to activate: {exc}") from exc
     tool_names = sorted(manifest.get("tools", {}))
     builder = AgentContextBuilder(
         agent_id="acs-generator", framework="acs-generator", session_id="smoke"
     )
-    evaluated = 0
     for point in manifest["intervention_points"]:
         contexts = _contexts_for(point, builder, tool_names)
         if not contexts:
@@ -244,17 +187,12 @@ def smoke_evaluate(
             )
         for context in contexts:
             verdict = policy.evaluate(point, context)
-            evaluated += 1
             reason = verdict.reason or ""
             if reason.startswith("runtime_error:"):
                 raise ValidationError(
                     f"generated policy fails closed at '{point}' on a well-formed "
                     f"agent-hooks context with {reason}"
                 )
-    if evaluated < len(
-        manifest["intervention_points"]
-    ):  # pragma: no cover - guarded above
-        raise ValidationError("smoke evaluation skipped a guarded intervention point")
     if not tool_names:
         guarded_tool_points = [
             point
@@ -321,4 +259,4 @@ def _contexts_for(
         return [builder.output(content=text)]
     if point == "agent_shutdown":
         return [builder.agent_shutdown(reason="completed")]
-    return []
+    raise ValidationError(f"unsupported smoke point '{point}'")

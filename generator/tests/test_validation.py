@@ -16,7 +16,6 @@ from agent_control_spec_generator.validation import (
     ValidationError,
     check_regex_patterns,
     dump_manifest_yaml,
-    validate_artifacts,
 )
 from agent_control_spec_generator.vocabulary import manifest_version
 from agent_hooks import AgentContextBuilder
@@ -223,15 +222,14 @@ def test_removed_policy_input_members_are_refused(tmp_path):
 
 
 def test_the_removed_transform_root_is_refused():
-    manifest = {
-        "agent_control_specification_version": manifest_version(),
-        "metadata": {"name": "x"},
-        "policies": {},
-        "intervention_points": {},
-    }
-    rego = 'package x\n\nverdict := {"transform": {"path": "$policy_target.content"}}\n'
-    with pytest.raises(ValidationError, match=r"removed \$policy_target"):
-        validate_artifacts(manifest, dump_manifest_yaml(manifest), rego, "x")
+    from agent_control_spec_generator import GenerationError
+
+    plan = redaction_plan("secret")
+    plan["rules"][0]["effects"][0]["path"] = "$policy_target.content"
+    with pytest.raises(GenerationError, match=r"removed \$policy_target"):
+        GenerationEngine(StubLanguageModel([plan]), max_attempts=1).generate(
+            prompt=PROSE, write=False
+        )
 
 
 def test_a_rego_module_that_does_not_compile_is_refused(monkeypatch, tmp_path):

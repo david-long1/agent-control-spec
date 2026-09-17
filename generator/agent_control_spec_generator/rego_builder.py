@@ -11,20 +11,13 @@ rules producing conflicting values for one entrypoint.
 from __future__ import annotations
 
 import json
-import re
 from collections import defaultdict
 from typing import Any
 
-from .plan import PolicyPlan, RulePlan
+from .plan import PolicyPlan, RulePlan, transform_segments
 from .vocabulary import INTERVENTION_POINT_NAMES, POLICY_INPUT_POINT_KEY
 
 INDENT = "    "
-
-# The section 14 transform path grammar as the engine enforces it: `$target`
-# followed by zero or more `.field` or `[N]` segments. The engine rejects a
-# quoted bracket key and a trailing empty segment, so anything outside this
-# shape is reset to the root rather than compiled into a load failure.
-_TRANSFORM_PATH_RE = re.compile(r"^\$target(\.[A-Za-z_][A-Za-z0-9_]*|\[[0-9]+\])*$")
 
 # Higher wins when more than one rule body matches at the same point.
 # `transform` outranks `warn` so a redaction is never shadowed by an advisory
@@ -124,7 +117,9 @@ def _read_expr_for_path(path: str) -> str:
     reads `input.policy_target.value.text` and `$target[0]` reads
     `input.policy_target.value[0]`.
     """
-    return "input.policy_target.value" + path[len("$target") :]
+    return "input.policy_target.value" + "".join(
+        f"[{json.dumps(segment)}]" for segment in transform_segments(path)
+    )
 
 
 def _render_transform_verdict(
@@ -138,7 +133,7 @@ def _render_transform_verdict(
         # are deliberately not unioned across sibling rules, because another
         # rule's redaction is gated by that rule's conditions and applying it
         # here would redact content this rule was not authorized to touch.
-        path = _normalize_transform_path(str(redacts[0].get("path") or "$target"))
+        path = redacts[0]["path"]
         read_expr = _read_expr_for_path(path)
         extra_body = [f"is_string({read_expr})"]
         expr = read_expr
@@ -150,30 +145,9 @@ def _render_transform_verdict(
             )
         extra_body.append(f"__transform_value := {expr}")
         return _verdict_with_value_ref(verdict, path, "__transform_value"), extra_body
-    effect = rule.effects[0] if rule.effects else {}
-    path = _normalize_transform_path(str(effect.get("path") or "$target"))
-    if "value" in effect:
-        verdict["transform"] = {"path": path, "value": effect["value"]}
-        return json.dumps(verdict, indent=4), []
-    # A transform decision with no usable effect. Replacing the target with
-    # itself keeps the verdict valid, where omitting `transform` would fail
-    # closed with `runtime_error:policy_output_invalid`.
-    extra_body = [f"__transform_value := {_read_expr_for_path(path)}"]
-    return _verdict_with_value_ref(verdict, path, "__transform_value"), extra_body
-
-
-def _normalize_transform_path(path: str) -> str:
-    # Models routinely append `.value`, conflating the transform root with
-    # the `input.policy_target.value` read path. The policy target is the
-    # value, so `$target.value` indexes into it and the engine rejects that
-    # on a scalar target. Deeper paths are left intact.
-    if path == "$target.value":
-        return "$target"
-    # Anything outside the grammar is reset to the root so the engine never
-    # fails closed on a malformed path.
-    if not _TRANSFORM_PATH_RE.match(path):
-        return "$target"
-    return path
+    effect = rule.effects[0]
+    verdict["transform"] = {"path": effect["path"], "value": effect["value"]}
+    return json.dumps(verdict, indent=4), []
 
 
 def _verdict_with_value_ref(verdict: dict[str, Any], path: str, value_ref: str) -> str:

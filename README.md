@@ -34,7 +34,7 @@ those are host obligations defined by agent-hooks.
 | `sdk/python/` | Python binding: `agent_control_spec` package wrapping the engine as an `agent_hooks` interceptor |
 | `sdk/node/` | Node binding: `@responsibleai/agent-control-spec` |
 | `sdk/dotnet/` | .NET binding: `ResponsibleAI.AgentControlSpec` |
-| `generator/` | `acs-policy-gen`, which turns natural-language guardrails into a manifest and Rego policy through a language model, validated by the engine |
+| [`generator/`](generator/README.md) | Optional `acs-policy-gen` authoring tool. Produces draft manifests and Rego from prose, with parser checks and ACS validation |
 | `spec/` | The ACS specification (policy plane) and schemas |
 | `policy/` | Cedar and Rego policy libraries |
 | `fixtures/` | Evaluation fixtures |

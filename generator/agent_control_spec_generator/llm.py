@@ -1,16 +1,6 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
-"""The model boundary.
-
-The generator calls exactly one thing on a model, `complete(system, user)`,
-returning the raw response text. Everything downstream treats that text as
-untrusted input and validates it, so a host can substitute any provider,
-a gateway, or a recorded transcript without changing the generator.
-
-No provider is contacted at import time and no credential is read at import
-time, so importing this package in a test or a CI job performs no network
-input or output.
-"""
+"""Chat-completion transport and the injectable model protocol."""
 
 from __future__ import annotations
 
@@ -22,22 +12,32 @@ from urllib import error, parse, request
 DEFAULT_API_BASE = "https://api.openai.com/v1"
 DEFAULT_MODEL = "gpt-4o-mini"
 REQUEST_TIMEOUT_SECONDS = 60
+MAX_RESPONSE_BYTES = 1_000_000
 
 
 class LanguageModel(Protocol):
-    """One completion call returning raw response text."""
-
     def complete(self, system: str, user: str) -> str: ...
 
 
-class OpenAICompatibleLanguageModel:
-    """Chat completions against an OpenAI-compatible or Azure OpenAI endpoint.
+class ProviderError(RuntimeError):
+    """A provider/configuration failure, never retried as a bad policy plan."""
 
-    Azure mode is selected by an explicit `api_version` or by an
-    `*.azure.com` host, and changes both the auth header and the query
-    string. Sampling is pinned to `temperature=0` with a JSON response
-    format, so the same prompt and the same deployment produce the same plan
-    as far as the provider allows.
+
+class _NoRedirects(request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def _is_azure_api_base(base: str) -> bool:
+    hostname = (parse.urlsplit(base).hostname or "").lower().rstrip(".")
+    return hostname == "azure.com" or hostname.endswith(".azure.com")
+
+
+class OpenAICompatibleLanguageModel:
+    """Use OpenAI-compatible v1 or Azure deployment chat completions.
+
+    Credentials are read at construction; a request occurs only in complete().
+    Redirects are errors. Provider bodies are not included in exception messages.
     """
 
     def __init__(
@@ -51,25 +51,58 @@ class OpenAICompatibleLanguageModel:
         self.api_base = (
             api_base or os.getenv("ACS_GENERATOR_API_BASE") or DEFAULT_API_BASE
         ).rstrip("/")
-        self.api_key = api_key or os.getenv("ACS_GENERATOR_API_KEY")
+        self.api_key = (
+            api_key if api_key is not None else os.getenv("ACS_GENERATOR_API_KEY")
+        )
         self.model = model or os.getenv("ACS_GENERATOR_MODEL") or DEFAULT_MODEL
         self.api_version = api_version or os.getenv("ACS_GENERATOR_API_VERSION")
+        try:
+            parsed = parse.urlsplit(self.api_base)
+            valid = (
+                parsed.hostname is not None
+                and not parsed.username
+                and not parsed.password
+                and not parsed.query
+                and not parsed.fragment
+                and (
+                    parsed.scheme == "https"
+                    or parsed.scheme == "http"
+                    and parsed.hostname in {"localhost", "127.0.0.1", "::1"}
+                )
+            )
+            port = parsed.port
+            valid = valid and (port is None or 0 < port < 65536)
+        except ValueError:
+            valid = False
+        if not valid:
+            raise ProviderError(
+                "API base must be HTTPS without credentials, query or fragment (HTTP is allowed only for loopback tests)"
+            )
         self.is_azure = self.api_version is not None or _is_azure_api_base(
             self.api_base
         )
+        if self.api_version:
+            # Accept either the Azure resource root or an explicit deployment
+            # base. Do not guess a deployment when the caller supplied a path.
+            if not parsed.path.strip("/"):
+                self.api_base += "/openai/deployments/" + parse.quote(
+                    self.model, safe=""
+                )
+            elif "/openai/deployments/" not in parsed.path:
+                raise ProviderError(
+                    "api-version requires an Azure resource root or /openai/deployments/NAME base"
+                )
+        elif self.is_azure and not parsed.path.strip("/"):
+            self.api_base += "/openai/v1"
 
     def complete(self, system: str, user: str) -> str:
         if not self.api_key:
-            raise RuntimeError(
-                "no API key. Pass --api-key or set ACS_GENERATOR_API_KEY, or supply "
-                "your own LanguageModel to GenerationEngine"
-            )
-        if any(char in self.api_key for char in "\r\n\x00"):
-            # A key carrying a control character makes http.client raise with
-            # the header value in the message, and the CLI prints the message.
-            raise RuntimeError(
-                "the API key contains a control character; check for a stray newline "
-                "in the environment variable or the flag"
+            raise ProviderError("ACS_GENERATOR_API_KEY is required")
+        if not isinstance(self.api_key, str) or any(
+            ord(char) < 33 or ord(char) > 126 for char in self.api_key
+        ):
+            raise ProviderError(
+                "API key contains whitespace or a control character/non-ASCII character"
             )
         payload = {
             "model": self.model,
@@ -77,102 +110,60 @@ class OpenAICompatibleLanguageModel:
                 {"role": "system", "content": system},
                 {"role": "user", "content": user},
             ],
-            "temperature": 0,
             "response_format": {"type": "json_object"},
+            "max_completion_tokens": 4096,
         }
-        url = f"{self.api_base}/chat/completions"
+        url = self.api_base + "/chat/completions"
+        if self.api_version:
+            url += "?" + parse.urlencode({"api-version": self.api_version})
         headers = {"Content-Type": "application/json"}
         if self.is_azure:
-            if self.api_version:
-                url += f"?api-version={self.api_version}"
             headers["api-key"] = self.api_key
         else:
-            headers["Authorization"] = f"Bearer {self.api_key}"
+            headers["Authorization"] = "Bearer " + self.api_key
         req = request.Request(
-            url,
-            data=json.dumps(payload).encode("utf-8"),
-            headers=headers,
-            method="POST",
+            url, json.dumps(payload).encode("utf-8"), headers, method="POST"
         )
         try:
-            with _NO_REDIRECTS.open(req, timeout=REQUEST_TIMEOUT_SECONDS) as response:
-                body = json.loads(response.read().decode("utf-8"))
+            with request.build_opener(_NoRedirects()).open(
+                req, timeout=REQUEST_TIMEOUT_SECONDS
+            ) as response:
+                encoded = response.read(MAX_RESPONSE_BYTES + 1)
         except error.HTTPError as exc:
-            raise RuntimeError(_http_error_detail(exc)) from exc
+            status = exc.code
+            exc.close()
+            raise ProviderError(
+                f"LLM request failed with HTTP {status}; check endpoint, deployment, "
+                "credentials and provider diagnostics (response body omitted)"
+            ) from None
+        except (OSError, ValueError):
+            raise ProviderError(
+                "LLM transport failed; check connectivity and endpoint configuration"
+            ) from None
+        if len(encoded) > MAX_RESPONSE_BYTES:
+            raise ProviderError("provider response exceeds 1 MB")
         try:
-            return body["choices"][0]["message"]["content"]
-        except (KeyError, IndexError, TypeError) as exc:
-            raise RuntimeError(
-                f"provider returned no completion content: {json.dumps(body)[:400]}"
-            ) from exc
-
-
-class _NoRedirects(request.HTTPRedirectHandler):
-    """Refuse to follow a redirect on a credentialed request.
-
-    The request carries the provider credential in a header. Following a
-    redirect would re-issue it against whatever host the response named, so
-    the redirect is surfaced as an error and the caller decides.
-    """
-
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        return None
-
-
-_NO_REDIRECTS = request.build_opener(_NoRedirects)
-
-
-def _is_azure_api_base(api_base: str) -> bool:
-    hostname = parse.urlparse(api_base).hostname or ""
-    normalized = hostname.lower().rstrip(".")
-    return normalized == "azure.com" or normalized.endswith(".azure.com")
-
-
-def _http_error_detail(exc: error.HTTPError) -> str:
-    """The provider's own reason, not just the status line.
-
-    `urllib` surfaces only "HTTP Error 400: Bad Request", while the body
-    carries what actually happened. Guardrail prose describing an attack the
-    policy should block reads like an attack to a provider content filter,
-    and the resulting 400 is otherwise indistinguishable from a malformed
-    request.
-    """
-    base = f"LLM request failed with HTTP {exc.code}"
-    try:
-        payload = json.loads(exc.read().decode("utf-8"))
-    except Exception:  # noqa: BLE001 - fall back to the bare status line
-        return base
-    err = payload.get("error", payload) if isinstance(payload, dict) else {}
-    parts = [base]
-    if isinstance(err, dict):
-        if err.get("code"):
-            parts.append(f"code={err['code']}")
-        if err.get("message"):
-            parts.append(str(err["message"]))
-        inner = err.get("innererror") or {}
-        filtered = (
-            inner.get("content_filter_result") if isinstance(inner, dict) else None
-        )
-        if isinstance(filtered, dict):
-            flagged = sorted(
-                key
-                for key, value in filtered.items()
-                if isinstance(value, dict)
-                and (value.get("filtered") or value.get("detected"))
-            )
-            if flagged:
-                parts.append(f"content_filter={flagged}")
-    return ". ".join(parts)
+            body = json.loads(encoded)
+            choice = body["choices"][0]
+            if choice.get("finish_reason") != "stop":
+                raise ProviderError(
+                    "provider did not complete the response (truncation or filtering)"
+                )
+            message = choice["message"]
+            if message.get("refusal"):
+                raise ProviderError("provider refused the generation request")
+            content = message["content"]
+            if not isinstance(content, str) or not content.strip():
+                raise ProviderError("provider returned no completion content")
+            return content
+        except (ValueError, KeyError, IndexError, TypeError, AttributeError):
+            raise ProviderError(
+                "provider returned an invalid chat-completion response"
+            ) from None
 
 
 class StubLanguageModel:
-    """A scripted model. Contacts nothing.
-
-    Responses are returned in order and the last one repeats, so a single
-    response covers a run that needs no repair and a list exercises the
-    repair loop deterministically. Every prompt pair is recorded, which is
-    how a test asserts what the generator asked for.
-    """
+    """Recorded responses for offline examples and tests; never contacts a provider."""
 
     def __init__(self, responses: list[str | dict]) -> None:
         if not responses:
@@ -184,6 +175,4 @@ class StubLanguageModel:
 
     def complete(self, system: str, user: str) -> str:
         self.prompts.append((system, user))
-        if len(self.prompts) <= len(self._responses):
-            return self._responses[len(self.prompts) - 1]
-        return self._responses[-1]
+        return self._responses[min(len(self.prompts), len(self._responses)) - 1]

@@ -83,7 +83,7 @@ def test_a_non_empty_output_directory_is_refused_without_force(
 
     assert code == 1
     assert (out / "notes.txt").read_text(encoding="utf-8") == "work in progress"
-    assert "notes.txt" in capsys.readouterr().err
+    assert "not empty" in capsys.readouterr().err
 
 
 def test_force_regenerates_over_an_earlier_run(scripted, tmp_path):
@@ -135,7 +135,11 @@ def test_tool_flags_become_catalog_entries(scripted, tmp_path):
 
     assert code == 0
     document = yaml.safe_load((out / "manifest.yaml").read_text(encoding="utf-8"))
-    assert document["tools"]["wire_transfer"]["clearance"] == ["banking", "payments"]
+    assert document["tools"]["wire_transfer"]["security_labels"] == [
+        "banking",
+        "payments",
+    ]
+    assert "clearance" not in document["tools"]["wire_transfer"]
     assert "wire_transfer" in model.prompts[0][1]
 
 

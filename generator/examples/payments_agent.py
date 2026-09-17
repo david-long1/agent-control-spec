@@ -1,20 +1,17 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
-"""Generate a payments policy from prose, then enforce it. No network calls.
+"""Generate a payments policy from a scripted response and evaluate it with ACS.
 
 Run it:
 
-    python examples/payments_agent.py
+    python generator/examples/payments_agent.py
 
 The model is a `StubLanguageModel` holding one scripted plan, so the run is
 deterministic and needs no provider credential. Swap in
 `OpenAICompatibleLanguageModel()` and the same code calls a real provider.
 
-The second half is the part worth reading. It loads the generated artifacts
-into `agent_control_spec`, the same runtime a host embeds, and evaluates real
-agent-hooks contexts against them. A generated policy is only interesting if
-it decides, so this shows the deny, the escalation, the redaction, and the
-pass through the runtime rather than asserting them on paper.
+The example annotator below is local test logic, not a content-safety service.
+This example evaluates verdicts; it does not execute or enforce host actions.
 """
 
 from __future__ import annotations
@@ -90,11 +87,7 @@ SCRIPTED_PLAN = {
 
 
 class AccountNumberClassifier:
-    """The host's annotator. ACS ships no classifier of its own.
-
-    A real one calls a content-safety endpoint or a local model. This one
-    matches the shape so the generated rule has something to read.
-    """
+    """A local example dispatcher matching the generated annotation contract."""
 
     def dispatch(
         self,
@@ -141,7 +134,7 @@ def main() -> int:
         print("-" * (len(result.slug) + 12))
         print(result.rego)
 
-        print("Enforcing the generated policy through agent_control_spec")
+        print("Evaluating the generated policy through agent_control_spec")
         print("---------------------------------------------------------")
         policy = ActivatedPolicy.activate(
             str(out_dir / "manifest.yaml"),

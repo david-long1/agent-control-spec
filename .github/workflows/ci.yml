@@ -46,6 +46,13 @@ jobs:
         with: { python-version: "3.12" }
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
       - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+      - name: Install OPA for generator authoring checks
+        run: |
+          curl -fsSL -o opa \
+            https://github.com/open-policy-agent/opa/releases/download/v1.20.2/opa_linux_amd64_static
+          echo "69da5179ee403d10fa11bab6cfb4ffb0d23dba5f9b682fa977db772a1da5670f  opa" | sha256sum -c -
+          chmod +x opa
+          sudo install -m 0755 opa /usr/local/bin/opa
       - name: Install locked dependencies, then the package itself
         # requirements-dev.lock pins every transitive dep including the
         # maturin build backend; --no-build-isolation makes the editable
@@ -60,12 +67,8 @@ jobs:
         # --no-deps because agent-control-spec is already installed above from
         # this tree; resolving it would pull the published wheel instead and
         # the generator would then be validated against a different engine
-        # than the one under test. PyYAML is the generator's only other
-        # dependency and is pinned here rather than added to
-        # requirements-dev.lock, which is compiled output shared with the
-        # binding's own job.
+        # than the one under test.
         run: |
-          uv pip install --system pyyaml==6.0.3
           uv pip install --system --no-deps ./generator
           pytest generator -v
 

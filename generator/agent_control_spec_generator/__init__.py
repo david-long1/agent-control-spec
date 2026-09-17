@@ -8,6 +8,7 @@ constrained policy plan, compiles that plan into an ACS manifest and a Rego
 module, and validates both with `agent_control_spec`, the engine that will
 evaluate them. Artifacts are written only after validation passes.
 
+    from pathlib import Path
     from agent_control_spec_generator import GenerationEngine
     from agent_control_spec_generator.llm import OpenAICompatibleLanguageModel
 

@@ -25,7 +25,7 @@ def test_non_json_response_is_rejected_with_the_decoder_message():
 
 
 def test_json_that_is_not_an_object_is_rejected():
-    with pytest.raises(PlanError, match="must be a JSON object"):
+    with pytest.raises(PlanError, match="must be an object"):
         parse_policy_plan("[1, 2, 3]")
 
 
@@ -62,7 +62,7 @@ def test_unconditional_blocking_rule_is_rejected():
 def test_blank_conditions_do_not_count_as_conditions():
     plan = minimal_plan()
     plan["rules"][0]["conditions"] = ["", "   ", "\n"]
-    with pytest.raises(PlanError, match="at least one condition"):
+    with pytest.raises(PlanError, match="condition must be a non-empty string"):
         parse(plan)
 
 
@@ -91,14 +91,13 @@ def test_unknown_annotator_type_is_rejected():
         parse(plan)
 
 
-def test_effects_on_a_deny_are_carried_but_never_compiled():
-    """The plan keeps them so the engine module can warn. `rego_builder`
-    drops them, because transform is the only value-changing verdict."""
+def test_effects_on_a_deny_are_rejected():
     plan = minimal_plan()
     plan["rules"][0]["effects"] = [
         {"type": "redact", "path": "$target", "pattern": "x"}
     ]
-    assert parse(plan).rules[0].effects
+    with pytest.raises(PlanError, match="nothing will be dropped"):
+        parse(plan)
 
 
 def test_append_effect_is_rejected_rather_than_approximated():
@@ -239,7 +238,7 @@ def test_a_transform_at_startup_or_shutdown_is_rejected(point: str):
 
 
 def test_tool_entries_accept_strings_and_objects():
-    plan = minimal_plan(tools=["a", {"id": "b"}, {"name": "c"}, {}])
+    plan = minimal_plan(tools=["a", {"id": "b"}, {"name": "c"}])
     assert parse(plan).tools == ("a", "b", "c")
 
 
@@ -322,25 +321,11 @@ def test_condition_regexes_are_collected_from_every_builtin():
     assert condition_regex_patterns(plan) == ("a[0-9]+", "b[0-9]+", "c[0-9]+")
 
 
-def test_a_computed_regex_pattern_is_reported_rather_than_guessed():
-    """A pattern built at runtime cannot be checked statically. It is skipped
-    rather than approximated, and it evaluates to undefined rather than
-    matching loosely, so skipping it does not widen anything."""
-    from agent_control_spec_generator.plan import condition_regex_patterns
-
-    plan = parse(
-        minimal_plan(
-            rules=[
-                {
-                    "point": "input",
-                    "decision": "deny",
-                    "reason": "blocked",
-                    "conditions": [
-                        "regex.match(pattern, input.policy_target.value.content)"
-                    ],
-                }
-            ]
-        )
-    )
-
-    assert condition_regex_patterns(plan) == ()
+def test_a_computed_regex_pattern_is_rejected_instead_of_skipping_validation():
+    plan = minimal_plan()
+    plan["rules"][0]["conditions"] = [
+        "pattern := input.snapshot.pattern",
+        "regex.match(pattern, input.policy_target.value.content)",
+    ]
+    with pytest.raises(PlanError, match="computed patterns cannot be validated"):
+        parse(plan)
