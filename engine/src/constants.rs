@@ -2,6 +2,9 @@ pub(crate) mod annotation {
     pub(crate) const FROM: &str = "from";
     pub(crate) const INPUT_FROM: &str = "input_from";
     pub(crate) const TYPE: &str = "type";
+    /// Telemetry metadata key naming an annotation's declared
+    /// dependencies. Names only, never annotation values.
+    pub(crate) const NEEDS: &str = "annotation_needs";
 }
 
 /// SHA-256 digest sizes shared by the `extends` integrity validators so the
@@ -23,7 +26,8 @@ pub mod reserved_reason {
 }
 
 pub(crate) mod manifest_version {
-    pub(crate) const SUPPORTED: [&str; 1] = ["0.4.0-alpha.1"];
+    pub(crate) const ANNOTATION_CHAINING: &str = "0.5.0-alpha.1";
+    pub(crate) const SUPPORTED: [&str; 2] = ["0.4.0-alpha.1", ANNOTATION_CHAINING];
 }
 
 pub(crate) mod engine {

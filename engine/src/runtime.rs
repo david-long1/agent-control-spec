@@ -1,6 +1,6 @@
 use crate::{
     annotation::{AnnotatorDispatcher, AnnotatorInvocation},
-    constants::policy_input as pi_key,
+    constants::{annotation as annotation_key, policy_input as pi_key},
     manifest::Manifest,
     policy::{prepare_policy_invocation, PolicyConfig, PreparedPolicyInvocation},
     policy_input::build_policy_input,
@@ -416,7 +416,12 @@ impl Runtime {
         }
 
         let mut annotations_map = Map::new();
-        for annotator_name in point_config.annotations.keys() {
+        let order = crate::manifest::annotation_dispatch_order(
+            intervention_point,
+            point_config,
+            &self.manifest,
+        )?;
+        for annotator_name in &order {
             let annotation_config = point_config
                 .annotations
                 .get(annotator_name)
@@ -438,6 +443,49 @@ impl Runtime {
                 annotation_config,
             );
 
+            let needs = self.manifest.annotation_dependencies(annotation_config)?;
+            // Each callback sees only its declared dependencies.
+            let staged_policy_input = if needs.is_empty() {
+                None
+            } else {
+                let mut visible = Map::new();
+                for need in needs {
+                    let result = annotations_map
+                        .get(need)
+                        .cloned()
+                        .ok_or_else(|| {
+                            RuntimeError::ManifestInvalid(format!(
+                                "annotator '{annotator_name}' needs '{need}', which has not run"
+                            ))
+                        })
+                        .inspect_err(|error| {
+                            self.emit_annotator_failed(intervention_point, annotator_name, error);
+                        })?;
+                    visible.insert(need.to_string(), result);
+                }
+                let mut staged = preliminary_policy_input.clone();
+                let object = staged
+                    .as_object_mut()
+                    .ok_or_else(|| {
+                        RuntimeError::ManifestInvalid(
+                            "preliminary policy input is not an object".to_string(),
+                        )
+                    })
+                    .inspect_err(|error| {
+                        self.emit_annotator_failed(intervention_point, annotator_name, error);
+                    })?;
+                object.insert(pi_key::ANNOTATIONS.to_string(), JsonValue::Object(visible));
+                self.limits
+                    .validate_policy_input(&staged)
+                    .inspect_err(|error| {
+                        self.emit_annotator_failed(intervention_point, annotator_name, error);
+                    })?;
+                Some(staged)
+            };
+            let dispatch_input = staged_policy_input
+                .as_ref()
+                .unwrap_or(preliminary_policy_input);
+
             if let Some(input_from) = annotator.input_from() {
                 let path = JsonPath::parse_with_snapshot_alias(input_from)
                     .map_err(|err| {
@@ -448,26 +496,21 @@ impl Runtime {
                     .inspect_err(|error| {
                         self.emit_annotator_failed(intervention_point, annotator_name, error);
                     })?;
-                let snapshot = preliminary_policy_input
-                    .get(pi_key::SNAPSHOT)
-                    .ok_or_else(|| {
-                        RuntimeError::ManifestInvalid(
-                            "preliminary policy input missing snapshot".to_string(),
-                        )
-                    })?;
-                path.resolve(&PathEnv::with_pi_and_snap(
-                    preliminary_policy_input,
-                    snapshot,
-                ))
-                .inspect_err(|error| {
-                    self.emit_annotator_failed(intervention_point, annotator_name, error);
+                let snapshot = dispatch_input.get(pi_key::SNAPSHOT).ok_or_else(|| {
+                    RuntimeError::ManifestInvalid(
+                        "preliminary policy input missing snapshot".to_string(),
+                    )
                 })?;
+                path.resolve(&PathEnv::with_pi_and_snap(dispatch_input, snapshot))
+                    .inspect_err(|error| {
+                        self.emit_annotator_failed(intervention_point, annotator_name, error);
+                    })?;
             }
 
             let dispatch_start = Instant::now();
             let output = catch_unwind(AssertUnwindSafe(|| {
                 self.annotations
-                    .dispatch(annotator_name, &annotator, preliminary_policy_input)
+                    .dispatch(annotator_name, &annotator, dispatch_input)
             }))
             .map_err(|payload| {
                 RuntimeError::AnnotationFailed(format!(
@@ -569,18 +612,47 @@ impl Runtime {
         }
     }
 
+    /// The dependencies declared for one annotation at one point, as
+    /// telemetry metadata. Annotator names come from the manifest, so
+    /// they are content safe and bounded, which annotation values are
+    /// not and never reach an event.
+    fn annotation_needs(
+        &self,
+        intervention_point: InterceptionPoint,
+        annotator_name: &str,
+    ) -> Option<String> {
+        if !self.manifest.annotation_chaining_enabled() {
+            return None;
+        }
+        let binding = &self
+            .manifest
+            .intervention_points
+            .get(&intervention_point)?
+            .annotations
+            .get(annotator_name)?;
+        // The validated value is an array. JSON preserves names containing commas.
+        binding
+            .fields
+            .get("needs")
+            .filter(|value| **value != serde_json::json!([]))
+            .map(JsonValue::to_string)
+    }
+
     fn emit_annotator_failed(
         &self,
         intervention_point: InterceptionPoint,
         annotator_name: &str,
         error: &RuntimeError,
     ) {
-        self.emit_event(
+        let mut event =
             TelemetryEvent::new(TelemetryEventType::AnnotatorFailed, intervention_point)
                 .with_annotator(annotator_name)
                 .with_reason_code(error.reason())
-                .with_optional_error_class(telemetry_error_class(Some(error.reason())).as_deref()),
-        );
+                .with_optional_error_class(telemetry_error_class(Some(error.reason())).as_deref());
+        if let Some(needs) = self.annotation_needs(intervention_point, annotator_name) {
+            event = event.with_metadata(annotation_key::NEEDS, needs);
+        }
+        self.emit_event(event);
     }
 
     fn emit_policy_failed(
@@ -609,13 +681,16 @@ impl Runtime {
         if !self.perf_telemetry.emit_external_events() {
             return;
         }
-        self.emit_event(
+        let mut event =
             TelemetryEvent::new(TelemetryEventType::AnnotatorDispatch, intervention_point)
                 .with_annotator(annotator_name)
                 .with_optional_reason_code(safe_telemetry_reason_code(reason).as_deref())
                 .with_optional_error_class(telemetry_error_class(reason).as_deref())
-                .with_duration_ms(duration_ms),
-        );
+                .with_duration_ms(duration_ms);
+        if let Some(needs) = self.annotation_needs(intervention_point, annotator_name) {
+            event = event.with_metadata(annotation_key::NEEDS, needs);
+        }
+        self.emit_event(event);
     }
 
     fn emit_policy_external_event(

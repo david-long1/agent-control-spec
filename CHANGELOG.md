@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Manifest contract `0.5.0-alpha.1` adds annotator chaining through point-binding
+  `needs`: dependencies run first, and consumers can read their outputs through
+  `$pi.annotations.<name>`. Legacy `0.4.0-alpha.1` semantics stay unchanged.
+  Migrate an entire `extends` chain together and rename any host-specific
+  `needs` setting first; see specification sections 2.1 and 10.1.
+  This is an unreleased contract change, not a release or package bump;
+  package versions remain `0.4.0-alpha.3`.
+
 - A manifest chain that fetches any `extends` URL is now URL sourced, and a
   URL sourced manifest may not read host secrets. A fetched document could
   name a host environment variable through `api_key_env` or one of the

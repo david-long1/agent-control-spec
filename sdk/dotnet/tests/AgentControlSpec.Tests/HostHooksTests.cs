@@ -87,6 +87,79 @@ public sealed class HostHooksTests : IDisposable
     }
 
     [Fact]
+    public async Task AnAnnotationWithNeedsRunsAfterAndSeesItsDependency()
+    {
+        var bundle = Path.Combine(_dir, "chain-bundle");
+        Directory.CreateDirectory(bundle);
+        File.WriteAllText(Path.Combine(bundle, "policy.rego"), """
+            package acs
+
+            decision := {"decision": "deny", "reason": "judge_blocked"} if {
+                input.annotations.judge.blocked == true
+            } else := {"decision": "allow"}
+            """);
+
+        // `judge` is listed first and sorts first, so only `needs` can
+        // produce the order this test asserts.
+        var manifest = Path.Combine(_dir, "chained-manifest.yaml");
+        File.WriteAllText(manifest, """
+            agent_control_specification_version: "0.5.0-alpha.1"
+            metadata:
+              name: host-hooks-chaining
+            annotators:
+              judge:
+                type: classifier
+              scan:
+                type: classifier
+            policies:
+              gate:
+                type: rego
+                bundle: ./chain-bundle
+            intervention_points:
+              input:
+                policy_target: "$snap.input"
+                annotations:
+                  judge:
+                    needs: [scan]
+                    from: "$pi.annotations.scan.spans"
+                  scan:
+                    from: "$target"
+                policy:
+                  id: gate
+                  query: data.acs.decision
+            """);
+
+        var order = new List<string>();
+        var seen = new List<string>();
+
+        using var interceptor = AcsHostInterceptor.FromPath(
+            manifest,
+            annotator: (name, _, policyInputJson) =>
+            {
+                order.Add(name);
+                var annotations = JsonNode.Parse(policyInputJson)!["annotations"]!;
+                seen.Add(annotations.ToJsonString());
+                if (name == "scan")
+                {
+                    return """{"spans":[1]}""";
+                }
+
+                var spans = annotations["scan"]!["spans"]!.AsArray();
+                return $$"""{"blocked":{{(spans.Count > 0 ? "true" : "false")}}}""";
+            });
+
+        var verdict = await interceptor.InterceptAsync(Input("leak"));
+
+        Assert.Equal(new[] { "scan", "judge" }, order);
+        // `scan` declares no dependency, so it is shown nothing.
+        Assert.Equal("{}", seen[0]);
+        // `judge` is shown exactly what it declared, and nothing else.
+        Assert.Equal("""{"scan":{"spans":[1]}}""", seen[1]);
+        Assert.Equal(Decision.Deny, verdict.Decision);
+        Assert.Equal("judge_blocked", verdict.Reason);
+    }
+
+    [Fact]
     public async Task AClassifierThatFailsDeniesRatherThanFindingNothing()
     {
         var manifest = WriteFixture();
