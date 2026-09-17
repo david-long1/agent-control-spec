@@ -355,6 +355,10 @@ def test_a_credentialed_request_does_not_follow_a_redirect(monkeypatch):
             self.end_headers()
             self.wfile.write(body)
 
+        # urllib changes a redirected POST to GET for 302. Record that method
+        # too, or this test would miss a followed redirect carrying credentials.
+        do_GET = do_POST
+
         def log_message(self, *args):
             pass
 
@@ -372,6 +376,8 @@ def test_a_credentialed_request_does_not_follow_a_redirect(monkeypatch):
     finally:
         first.shutdown()
         second.shutdown()
+        first.server_close()
+        second.server_close()
 
     assert seen.get("first") == "Bearer SECRET-KEY"
     assert "second" not in seen, "the credential must not reach the redirect target"
