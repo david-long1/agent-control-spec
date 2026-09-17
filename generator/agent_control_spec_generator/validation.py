@@ -63,17 +63,60 @@ def validate_artifacts(
     slug: str,
     *,
     regex_patterns: tuple[str, ...] = (),
+    transform_paths: tuple[str, ...] = (),
 ) -> ValidationResult:
     """Compile the pair, check collected regex patterns, then smoke-evaluate."""
     warnings: list[str] = []
     _validate_with_engine(manifest_yaml, rego, slug)
     check_regex_patterns(tuple(dict.fromkeys(regex_patterns)))
+    check_transform_paths(tuple(dict.fromkeys(transform_paths)))
     warnings.extend(smoke_evaluate(manifest, manifest_yaml, rego, slug))
     return ValidationResult(warnings)
 
 
 def _bundles(rego: str, slug: str) -> dict[str, dict[str, Any]]:
     return {slug: {"modules": {f"{slug}.rego": rego}}}
+
+
+def check_transform_paths(paths: tuple[str, ...]) -> None:
+    """Exercise ACS's authoritative path parser even if no smoke rule fires."""
+    if not paths:
+        return
+    manifest = dump_manifest_yaml(
+        {
+            "agent_control_specification_version": manifest_version(),
+            "policies": {
+                "probe": {
+                    "type": "rego",
+                    "bundle": "./policy",
+                    "query": "data.path_probe.verdict",
+                }
+            },
+            "intervention_points": {
+                "input": {
+                    "policy_target": "$.target",
+                    "policy": {"id": "probe"},
+                }
+            },
+        }
+    )
+    module = """package path_probe
+verdict := {"decision": "transform", "transform": {
+    "path": input.policy_target.value.content, "value": "probe"
+}}
+"""
+    policy = ActivatedPolicy.from_memory(
+        manifest, {"probe": {"modules": {"probe.rego": module}}}
+    )
+    builder = AgentContextBuilder(
+        agent_id="generator", framework="path-check", session_id="probe"
+    )
+    for path in paths:
+        verdict = policy.evaluate("input", builder.input(content=path))
+        if verdict.decision.value != "transform":
+            raise ValidationError(
+                f"engine rejected transform path {path!r}: {verdict.reason}"
+            )
 
 
 def _validate_with_engine(manifest_yaml: str, rego: str, slug: str) -> None:

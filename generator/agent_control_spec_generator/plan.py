@@ -279,7 +279,7 @@ def _effect(effect: Any, point: str) -> None:
     effect = _object(
         effect, {"type", "path", "pattern", "value", "replacement"}, "effect"
     )
-    kind = effect.get("type")
+    kind = _string(effect.get("type"), "effect type")
     if kind not in {"replace", "redact"}:
         raise PlanError(f"{kind} effect is not expressible; use replace or redact")
     path = _string(effect.get("path"), "effect path")

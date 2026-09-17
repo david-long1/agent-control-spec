@@ -218,6 +218,23 @@ def inspect_conditions(conditions: tuple[str, ...], point: str) -> ConditionInfo
         return ConditionInfo((), frozenset(), frozenset(), False)
     tree = _parse("\n".join(conditions))
     nodes = list(_walk(tree))
+    # Literal/alias inference below is single-scope. Flattening bindings from
+    # comprehensions or every blocks would let a local literal certify an
+    # unrelated request-controlled variable with the same name.
+    if any(
+        node.get("type")
+        in {
+            "arraycomprehension",
+            "setcomprehension",
+            "objectcomprehension",
+        }
+        or "domain" in node
+        for node in nodes
+    ):
+        raise ConditionError(
+            "nested condition scopes are not supported; use top-level some statements "
+            "instead of comprehensions or every blocks"
+        )
     calls = list(_calls(tree))
     if any(
         _ref(expr.get("terms", {})) == ("input",)

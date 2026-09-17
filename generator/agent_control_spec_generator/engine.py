@@ -52,7 +52,8 @@ Reference the current request via input. Input has exactly five members:
 intervention_point, policy_target (kind, path, value), snapshot, annotations, tool.
 input.tool is null outside pre_tool_call/post_tool_call. Declare the tools you use.
 Annotator results are at input.annotations.NAME; declare any annotator you need.
-Use direct input references or simple aliases. Regex patterns must be literal strings
+Use direct input references or simple aliases. Use top-level some statements for
+iteration, not comprehensions or every blocks. Regex patterns must be literal strings
 or variables assigned literal strings; no computed patterns or regex templates.
 Do not use external data, network calls, clocks, randomness, print, or with overrides.
 Do not introduce helper rules. Conditions are parsed before any evaluation.
@@ -165,6 +166,9 @@ class GenerationEngine:
                     slug,
                     regex_patterns=redact_patterns(plan)
                     + condition_regex_patterns(plan),
+                    transform_paths=tuple(
+                        effect["path"] for rule in plan.rules for effect in rule.effects
+                    ),
                 )
             except (PlanError, ValidationError) as exc:
                 diagnostics.append(f"attempt {attempt}: {exc}")

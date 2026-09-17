@@ -25,6 +25,7 @@ def build_report(
         "- OPA parsed the condition bodies and the generator checked supported references and functions.",
         "- ACS validated the manifest and compiled its in-memory Rego bundle.",
         "- The runtime regex engine accepted the collected patterns.",
+        "- ACS accepted each transform path's grammar, independent of rule matching.",
         "- ACS evaluated synthetic contexts at each bound point with empty host annotations.",
         "",
         "## Limits",

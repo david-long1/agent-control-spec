@@ -345,3 +345,77 @@ def test_azure_resource_root_builds_the_deployment_url(monkeypatch):
         "chat/completions?api-version=2024-10-21"
     )
     assert seen[0].get_header("Api-key") == "TEST"
+
+
+@pytest.mark.parametrize(
+    "nested",
+    [
+        'unused := [p | p := "ok"]',
+        'unused := {p | p := "ok"}',
+        'every p in ["ok"] { p == "ok" }',
+    ],
+)
+def test_nested_scope_cannot_certify_a_request_controlled_pattern(nested):
+    plan = minimal_plan(
+        rules=[
+            {
+                "point": "pre_tool_call",
+                "decision": "deny",
+                "reason": "blocked",
+                "conditions": [
+                    nested,
+                    "some p in input.policy_target.value.patterns",
+                    "regex.match(p, input.policy_target.value.content)",
+                ],
+            }
+        ]
+    )
+    with pytest.raises(GenerationError, match="nested condition scopes"):
+        GenerationEngine(StubLanguageModel([plan]), max_attempts=1).generate(
+            prompt="synthetic", write=False
+        )
+
+
+@pytest.mark.parametrize("kind", [[], {}, 1, None])
+def test_invalid_effect_type_is_repaired_without_a_typeerror(kind):
+    bad = minimal_plan(
+        rules=[
+            {
+                "point": "output",
+                "decision": "transform",
+                "reason": "redact",
+                "conditions": ['contains(input.policy_target.value.content, "secret")'],
+                "effects": [{"type": kind, "path": "$target.content", "value": "x"}],
+            }
+        ]
+    )
+    model = StubLanguageModel([bad, minimal_plan()])
+    result = GenerationEngine(model, max_attempts=2).generate(
+        prompt="synthetic", write=False
+    )
+    assert result.attempts == 2
+    assert "effect type" in model.prompts[1][1]
+
+
+def test_oversized_path_index_is_rejected_even_when_smoke_rule_does_not_match():
+    plan = minimal_plan(
+        rules=[
+            {
+                "point": "pre_model_call",
+                "decision": "transform",
+                "reason": "rewrite",
+                "conditions": ['input.snapshot.model.id == "production"'],
+                "effects": [
+                    {
+                        "type": "replace",
+                        "path": "$target[18446744073709551616]",
+                        "value": {"role": "user", "content": "safe"},
+                    }
+                ],
+            }
+        ]
+    )
+    with pytest.raises(GenerationError, match="engine rejected transform path"):
+        GenerationEngine(StubLanguageModel([plan]), max_attempts=1).generate(
+            prompt="synthetic", write=False
+        )

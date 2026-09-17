@@ -140,6 +140,9 @@ allows request comparisons, common string and collection operations, and regex
 calls with literal patterns or variables bound to literal strings. Unsupported
 functions, network calls, external data, input overrides, dynamic annotation
 names, and unresolved regex patterns are rejected with repair diagnostics.
+Iteration uses top-level `some` statements. Comprehensions and `every` blocks are
+outside this single-scope authoring subset, so nested bindings cannot be mistaken
+for a regex's literal pattern.
 This is a bounded authoring subset, not a general Rego type checker.
 
 ACS then validates the manifest and compiles the Rego bundle. The generator
@@ -157,7 +160,8 @@ warnings and `deny` with an approval block.
 There is at most one transform rule per point. It carries one replacement or
 multiple same-path redactions. Valid paths are preserved, including quoted keys
 and real nested members such as `$target.value`. A redact operation must target
-a string. All generated manifests read `$.target`, the agent-hooks value under
+a string. Every effect path also passes the runtime's path parser independently
+of the smoke cases. All generated manifests read `$.target`, the agent-hooks value under
 evaluation. Lifecycle transforms are rejected.
 
 The [Python SDK](../sdk/python/README.md) can activate these files or their
