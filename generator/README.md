@@ -146,7 +146,11 @@ for a regex's literal pattern.
 This is a bounded authoring subset, not a general Rego type checker.
 
 The native authoring helper accepts at most 64 KiB of Rego source per call and
-8 MiB of serialized AST output; Regorus's parser limits also apply. Its AST
+8 MiB of serialized AST output. A pre-parse guard limits nesting to 12 levels,
+structural tokens to 1,024, and depth-weighted byte work to 262,144 units.
+This rejects inputs that would trigger excessive parser backtracking before
+Regorus starts; it is not a timeout that leaves a native thread running.
+Regorus's own parser limits also apply. Its AST
 layout is pinned to Regorus 0.12.0 and is not an ACS interchange format.
 The generator rejects unsupported AST variants rather than skipping checks.
 

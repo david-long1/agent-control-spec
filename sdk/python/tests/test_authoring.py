@@ -68,3 +68,48 @@ def test_parsing_runs_with_an_empty_path():
         check=False,
     )
     assert completed.returncode == 0, completed.stderr
+
+
+def test_tiny_nested_array_is_rejected_before_regorus_backtracking():
+    code = """
+from agent_control_spec.authoring import parse_rego_ast
+source = 'package p\\nx := ' + '[' * 24 + '1' + ']' * 24
+try:
+    parse_rego_ast(source)
+except ValueError as exc:
+    assert 'nesting exceeds' in str(exc), exc
+else:
+    raise AssertionError('nested arrays were not rejected')
+"""
+    completed = subprocess.run(
+        [sys.executable, "-c", code],
+        text=True,
+        capture_output=True,
+        timeout=5,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+
+
+def test_work_budget_counts_literal_bytes_at_their_actual_nesting():
+    source = "package p\nx := " + "[" * 10 + json.dumps("x" * 1000) + "]" * 10
+    with pytest.raises(ValueError, match="complexity budget"):
+        parse_rego_ast(source)
+
+
+@pytest.mark.parametrize("tail", ['[\n"a"\n]' * 1100, " in\nx" * 1100])
+def test_reference_and_keyword_chains_have_a_structural_budget(tail):
+    with pytest.raises(ValueError, match="structural tokens"):
+        parse_rego_ast("package p\nx := input" + tail)
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "package p\nvalue := " + json.dumps('"' + "[" * 50 + '#"'),
+        "package p\nvalue := `" + "\\[" * 50 + "`",
+        "# " + "[" * 50 + "\npackage p\nvalue := 1",
+    ],
+)
+def test_delimiters_in_literals_and_comments_do_not_change_depth(source):
+    assert parse_rego_ast(source)[0]["version"] == 1

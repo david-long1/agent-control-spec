@@ -4,6 +4,7 @@
 
 import json
 import subprocess
+import sys
 
 import pytest
 from agent_control_spec import _native
@@ -137,3 +138,32 @@ def test_native_parser_errors_remain_repairable():
         )
         == plan
     )
+
+
+def test_pathological_nesting_enters_repair_promptly():
+    code = """
+from agent_control_spec_generator import GenerationEngine, StubLanguageModel
+good = {'name': 'good', 'rules': [{
+    'point': 'input', 'decision': 'deny', 'reason': 'blocked',
+    'conditions': ['input.policy_target.value.content == "secret"']
+}]}
+bad = {'name': 'bad', 'rules': [{
+    'point': 'input', 'decision': 'deny', 'reason': 'blocked',
+    'conditions': [
+        'x := ' + '[' * 24 + '"ok"' + ']' * 24,
+        'input.policy_target.value.content == "ok"'
+    ]
+}]}
+model = StubLanguageModel([bad, good])
+result = GenerationEngine(model, max_attempts=2).generate(prompt='synthetic', write=False)
+assert result.attempts == 2
+assert 'nesting exceeds' in model.prompts[1][1]
+"""
+    completed = subprocess.run(
+        [sys.executable, "-c", code],
+        text=True,
+        capture_output=True,
+        timeout=5,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr

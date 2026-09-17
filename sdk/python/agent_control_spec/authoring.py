@@ -21,8 +21,10 @@ def parse_rego_ast(source: str) -> list[dict[str, Any]]:
 
     Parsing does not evaluate code, load files or fetch imports. Invalid syntax
     and exceeded parser limits raise ValueError. Input is capped at 64 KiB and
-    serialized output at 8 MiB; Regorus's line/column/expression limits also apply.
-    Native parsing releases the GIL. This is not a policy validation verdict.
+    serialized output at 8 MiB. Preflight limits nesting to 12 levels, structural
+    tokens to 1024, and depth-weighted byte work to 262144 units. Regorus's
+    own parser limits also apply. Native parsing releases the GIL.
+    This is not a policy validation verdict.
     """
     try:
         return json.loads(_native.parse_rego_ast(source))
