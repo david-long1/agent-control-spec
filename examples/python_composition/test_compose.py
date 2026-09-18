@@ -86,11 +86,47 @@ class SdkTests(unittest.TestCase):
         self.assertIn("'value': 100", result.stdout)
 
     def test_documentation_links(self):
-        for relative in ("sdk/python/README.md", "docs/ACS-AND-AGENT-HOOKS.md"):
+        for relative in (
+            "sdk/python/README.md",
+            "docs/ACS-AND-AGENT-HOOKS.md",
+            "examples/python_composition/README.md",
+        ):
             path = ROOT / relative
             for target in re.findall(r"\]\(([^)#]+)\)", path.read_text()):
                 if not target.startswith("https://"):
                     self.assertTrue((path.parent / target).resolve().exists(), target)
+
+    def test_composition_guide_is_a_complete_integration(self):
+        guide = (ROOT / "docs/ACS-AND-AGENT-HOOKS.md").read_text()
+        blocks = re.findall(r"```python\n(.*?)\n```", guide, re.DOTALL)
+        self.assertEqual(len(blocks), 5)
+        instrument = (
+            "\nfrom unittest.mock import Mock\n"
+            "issue_refund = Mock(wraps=issue_refund)\n"
+        )
+        assertions = (
+            "\nassert issue_refund.call_count == 2\n"
+            "assert issue_refund.call_args_list[0].kwargs == "
+            "{'order_id': 'A-1001', 'amount': 40}\n"
+            "assert issue_refund.call_args_list[1].kwargs == "
+            "{'order_id': 'A-1003', 'amount': 100}\n"
+        )
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "\n\n".join(blocks[:-1]) + instrument + blocks[-1] + assertions,
+            ],
+            cwd=ROOT,
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        self.assertIn("allow allow True", result.stdout)
+        self.assertIn("deny deny False", result.stdout)
+        self.assertIn("transform transform True", result.stdout)
+        self.assertIn("[('limits', 'transform'), ('orders', 'allow')]", result.stdout)
 
 
 class CompositionTests(unittest.IsolatedAsyncioTestCase):

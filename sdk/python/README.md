@@ -12,13 +12,12 @@ python -m pip install "agent-control-spec==0.4.0a3"
 python -m pip check
 ```
 
-The examples use the published `agent-control-spec==0.4.0a3` and its
-dependency `agent-hooks-sdk==0.1.0a5`, tested on CPython 3.12.3,
-Linux x86-64. ACS requires Python 3.11 or newer. Install with normal
-dependency resolution, not `--no-deps`.
+ACS requires Python 3.11 or newer. The command installs the published
+`agent-control-spec==0.4.0a3` and its pinned dependency,
+`agent-hooks-sdk==0.1.0a5`. Use normal dependency resolution, not `--no-deps`.
 
 From this repository's root, run the complete
-[two-policy example](../../examples/python_composition/compose.py):
+[two-policy example](../../examples/python_composition/README.md):
 
 ```bash
 python examples/python_composition/compose.py
@@ -37,9 +36,7 @@ from agent_hooks import InterceptionEmitter, EnforcementMode
 from agent_control_spec import AcsInterceptor
 
 emitter = InterceptionEmitter(mode=EnforcementMode.ENFORCE)
-emitter.register(
-    AcsInterceptor("examples/python_composition/limits.yaml"), "limits"
-)
+emitter.register(AcsInterceptor("examples/python_composition/limits.yaml"), "limits")
 ```
 
 The manifest binds policies (Rego and Cedar through their built-in
@@ -74,7 +71,8 @@ builder = AgentContextBuilder(
 )
 for amount in (40, 150):
     context = builder.pre_tool_call(
-        call_id=f"refund-{amount}", name="issue_refund",
+        call_id=f"refund-{amount}",
+        name="issue_refund",
         args={"order_id": "A-1001", "amount": amount},
     )
     verdict = policy.evaluate("pre_tool_call", context)

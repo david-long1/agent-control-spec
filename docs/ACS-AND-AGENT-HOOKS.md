@@ -1,87 +1,195 @@
-# Compose ACS evaluations through Agent Hooks
+# Add ACS policy checks to a tool call with Agent Hooks
 
-ACS evaluates each policy and returns a verdict. Agent Hooks dispatches
-the controls, combines their verdicts, and applies transforms. The host
-enforces the result by deciding whether to call the operation and which
-arguments to pass.
+Put the hook where your application dispatches a tool, immediately before
+the tool executes. ACS evaluates each policy. Agent Hooks combines the
+verdicts. Your application either stops the call or executes it with the
+permitted arguments.
 
-## Run the example
+This guide wraps a refund operation with two policies: one caps the amount,
+and the other checks which orders may receive it. Follow the
+[SDK README](../sdk/python/README.md) to install the packages. The Python
+blocks below form one program; run them in order from the repository root.
 
-Follow the [Python SDK README](../sdk/python/README.md) for installation
-and activation. From the repository root:
+## 1. Identify the operation to guard
 
-```bash
-python examples/python_composition/compose.py
-python -m unittest discover -s examples/python_composition -v
+Start with the function your application already calls. Here it writes to
+an in-memory ledger so you can see what executed without making a payment:
+
+```python
+ledger = []
+
+
+def issue_refund(ledger, *, order_id, amount):
+    ledger.append({"order_id": order_id, "amount": amount})
 ```
 
-The example uses two native `AcsInterceptor` instances:
+Route every call to this function through the guard in step 4. In an agent,
+that usually means changing the shared tool dispatcher, not just the code
+that asks the model to choose a tool. A `pre_tool_call` check can prevent
+the effect; a `post_tool_call` check can only govern the result after it
+happens.
 
-- `limits.yaml` caps a positive refund at 100 and denies invalid amounts.
-- `orders.yaml` permits only orders `A-1001` and `A-1003`, with an amount
-  greater than zero and no more than 100.
+If your framework already emits Agent Hooks contexts, register the policies
+with its emitter instead of creating a second interception path. Otherwise,
+build the context at your application's dispatch boundary as shown next.
 
-Each manifest binds only `pre_tool_call` and points to its own Rego file.
-There are no annotators, external services, or payments. The operation
-appends its arguments to a local ledger.
+## 2. Map application data to the policy input
 
-## Select the composition profile
+Create an `AgentContextBuilder` for the session and use the method for the
+boundary you are guarding:
 
-The example explicitly uses `CompositionConfig.run_all()` in `ENFORCE`
-mode and registers `limits` before `orders`. This
-`sequential/run_all` profile lets the order policy evaluate the amount
-that will actually be refunded, including an earlier cap.
+```python
+from agent_hooks import AgentContextBuilder
 
-Agent Hooks calls both controls in order. An ordinary deny does not
-stop dispatch. Permitted transforms are applied before the next control,
-including the `tool_call.args` that ACS reads. The aggregate selects the
-highest severity: deny, then transform, then allow. A transform that
-cannot be applied stops the fold with a host-error denial.
+builder = AgentContextBuilder(
+    agent_id="refund-assistant", framework="example", session_id="session-1"
+)
 
-With `parallel/strictest`, both controls would instead receive isolated
-copies of the original context. The order policy would see 150 and deny,
-even if the limit policy proposed reducing it to 100.
 
-## Enforce and inspect the result
+def refund_context(call_id, order_id, amount):
+    return builder.pre_tool_call(
+        call_id=call_id,
+        name="issue_refund",
+        args={"order_id": order_id, "amount": amount},
+    )
+```
 
-[`compose.py`](../examples/python_composition/compose.py) constructs the
-full context with `AgentContextBuilder.pre_tool_call()`. Its `refund`
-function calls `await emitter.emit(context)` before invoking the tool.
-If that raises `InterceptionBlocked`, it returns the denial record
-without executing the operation. Otherwise, it passes `outcome.target`
-to `issue_refund`, not the arguments captured before evaluation.
+In your application, supply its agent and session identifiers and the
+actual invocation's ID, tool name, and arguments. The builder supplies
+the envelope, sequence, and timestamp. It places the arguments in
+`tool_call.args` and exposes them as the hook's `target`.
 
-The expected results are:
+The [limits manifest](../examples/python_composition/limits.yaml) and
+[orders manifest](../examples/python_composition/orders.yaml) both select
+`$.tool_call.args` as `policy_target` and `$.tool_call.name` as
+`tool_name_from`. Their Rego rules therefore read the amount at
+`input.policy_target.value.amount`. When adapting the example, keep the
+context shape, manifest paths, tool catalog, and policy field names aligned.
 
-| Request | Limits | Orders | Combined | Operation |
-| --- | --- | --- | --- | --- |
-| `A-1001`, 40 | allow | allow | allow | receives 40 |
-| `blocked-order`, 40 | allow | deny | deny | never called |
-| `A-1003`, 150 | transform | allow | transform | receives 100 |
+Both manifests bind `pre_tool_call` only. If your host emits other points,
+bind policies for those points or explicitly scope each ACS control.
+An unbound point is a denial, not an implicit pass. Scoping ACS must not
+disable other controls registered for that point.
 
-The script prints `record.verdict.decision` and `record.proceeds`, plus
-each entry's `name` and `decision` from `record.verdicts`. These
-contributions identify which controls ran; the final ledger verifies
-which operations executed. Records are in memory, not durable audit storage.
+## 3. Register the policies in the order they should run
 
-## Approvals and limits
+Construct the controls at startup and reuse the emitter for this session:
 
-This example has no approval resolver, and its policies never request
-approval. Under `run_all`, a plain deny takes precedence over a liftable
-deny; only an eligible aggregate reaches a configured resolver.
+```python
+from pathlib import Path
+from agent_control_spec import AcsInterceptor
+from agent_hooks import CompositionConfig, EnforcementMode, InterceptionEmitter
 
-The default `first_deny` profile behaves differently: with
-`on_approval: stop`, approval can end the fold before later controls run.
-`OnApproval.RESUME` continues after a permitted resolution, but a standing
-deny still stops dispatch. Do not rely on the default when later controls
-must participate.
+policies = Path("examples/python_composition")
+emitter = InterceptionEmitter(
+    mode=EnforcementMode.ENFORCE,
+    composition=CompositionConfig.run_all(),
+)
+emitter.register(AcsInterceptor(str(policies / "limits.yaml")), "limits")
+emitter.register(AcsInterceptor(str(policies / "orders.yaml")), "orders")
+```
 
-The second policy here only allows or denies, so it cannot rewrite a
-value after checking it. If you add a later transform or allow an approval
-resolver to transform arguments, revalidate required constraints on the
-final target before executing.
+The limits policy rejects invalid amounts and caps positive amounts at 100.
+The orders policy permits `A-1001` and `A-1003` only for a positive amount
+no greater than 100.
 
-Tested with published ACS `0.4.0a3`, Agent Hooks `0.1.0a5`, and CPython
-3.12.3 on Linux x86-64. This is a single pre-tool example, not a complete
-agent lifecycle integration. Its local synchronous policies execute inline;
-the SDK README explains the async and unbound-point caveats.
+Choose `sequential/run_all` here because the order check should see the
+amount **after** the cap. Agent Hooks runs `limits`, applies its transform
+to the context, then calls `orders` with the updated arguments. An ordinary
+deny does not stop evaluation of the remaining controls, but it blocks the
+operation. A transform that cannot be applied stops the fold with a denial.
+
+If your controls should judge the original request independently, use
+`parallel/strictest` instead. In this example that would deny a request for
+150: the order check would see 150, not the proposed cap of 100.
+
+`AcsInterceptor` runs synchronously. Before using this path with blocking
+policies in an async service, follow the
+[SDK's async guidance](../sdk/python/README.md#activating-a-policy-version).
+Awaiting the emitter does not make synchronous policy evaluation nonblocking.
+
+## 4. Execute only after the combined decision permits it
+
+Replace the direct tool invocation with a guarded call:
+
+```python
+from agent_hooks import InterceptionBlocked
+
+
+async def guarded_refund(call_id, order_id, amount):
+    context = refund_context(call_id, order_id, amount)
+    try:
+        outcome = await emitter.emit(context)
+    except InterceptionBlocked as blocked:
+        return blocked.result
+
+    issue_refund(ledger, **outcome.target)
+    return outcome.record
+```
+
+On denial, the application returns before calling `issue_refund`. On
+permission, it passes `outcome.target`, which contains any applied
+transformation. Passing the original `amount` would bypass the cap.
+In your application, handle the blocked result as a refused tool call,
+not as a reason to retry without the hook.
+
+Keep `ENFORCE` for this path. `EVALUATE_ONLY` records decisions without
+blocking calls or applying transforms. Evaluation errors fail closed;
+do not catch them and run the operation anyway.
+
+The orders policy is the last control here and never transforms arguments.
+If you add a later transform, recheck any required constraints it can
+invalidate before executing the operation.
+
+## 5. Check the decision and the arguments actually used
+
+Run one allowed request, one denied request, and one transformed request:
+
+```python
+import asyncio
+
+
+async def run():
+    for call_id, order_id, amount in (
+        ("allow", "A-1001", 40),
+        ("deny", "blocked-order", 40),
+        ("transform", "A-1003", 150),
+    ):
+        record = await guarded_refund(call_id, order_id, amount)
+        print(call_id, record.verdict.decision.value, record.proceeds)
+        print([(v.name, v.decision.value) for v in record.verdicts])
+
+    assert ledger == [
+        {"order_id": "A-1001", "amount": 40},
+        {"order_id": "A-1003", "amount": 100},
+    ]
+    print(ledger)
+
+
+asyncio.run(run())
+```
+
+The first request produces two allows. The second is denied by `orders`
+and never reaches the ledger. The third produces a transform from `limits`
+and an allow from `orders`; the operation receives 100 rather than 150.
+
+`record.verdict` is the combined decision. `record.verdicts` identifies the
+contributing controls and their decisions. Check both, but also test the
+operation itself: a denial must mean zero invocations, and a transform must
+change the arguments received. The
+[example and tests](../examples/python_composition/README.md) exercise these
+conditions using the published packages.
+
+## If your policies require approval
+
+Neither policy above requests approval. If you add a liftable deny, register
+a resolver only for decisions the application allows a reviewer to override.
+Without a resolver, that deny still blocks. With `run_all`, an ordinary deny
+from another control takes precedence and prevents approval from allowing
+the operation.
+
+Do not assume approval continues through later controls. The default
+`first_deny` profile uses `on_approval: stop`, which can skip them after an
+approval. `OnApproval.RESUME` continues that fold, but a standing deny still
+stops dispatch. Keep the profile explicit, and revalidate required constraints
+if an approval resolver changes the final arguments.
