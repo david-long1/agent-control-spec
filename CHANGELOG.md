@@ -15,6 +15,12 @@
   The runtime prepares dependency order and metadata once at construction and
   reuses one staged snapshot copy per evaluation. Consumers still copy their
   dependency outputs, so dispatch cost grows with the volume of those outputs.
+  Staged depth checks visit only the replaced annotations member, preserving
+  its depth under the policy-input root without rescanning the snapshot.
+  In a local release benchmark with 50 no-op annotators, a 50,000-element
+  array snapshot, and 100 measured evaluations after warmup, median chain/flat
+  time fell from 2.92x to 1.45x (51.3/17.6 ms to 25.4/17.6 ms).
+  Those figures describe that workload, not a general latency guarantee.
 
 - A manifest chain that fetches any `extends` URL is now URL sourced, and a
   URL sourced manifest may not read host secrets. A fetched document could

@@ -530,12 +530,13 @@ impl Runtime {
                     .inspect_err(|error| {
                         self.emit_annotator_failed(intervention_point, annotator_name, error);
                     })?;
-                object.insert(pi_key::ANNOTATIONS.to_string(), JsonValue::Object(visible));
+                let visible = JsonValue::Object(visible);
                 self.limits
-                    .validate_policy_input(staged)
+                    .validate_policy_annotations(&visible)
                     .inspect_err(|error| {
                         self.emit_annotator_failed(intervention_point, annotator_name, error);
                     })?;
+                object.insert(pi_key::ANNOTATIONS.to_string(), visible);
                 &*staged
             } else {
                 preliminary_policy_input
