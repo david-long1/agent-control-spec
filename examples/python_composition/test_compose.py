@@ -27,6 +27,11 @@ from agent_hooks import (
 from compose import EXAMPLE, make_emitter, refund
 
 ROOT = EXAMPLE.parents[1]
+REPOSITORY_BLOB = "https://github.com/responsibleai/agent-control-spec/blob/main/"
+
+
+def documentation_targets(text):
+    return re.findall(r"\]\(([^)#]+)(?:#[^)]*)?\)", text)
 
 
 def context(order_id="A-1001", amount=40):
@@ -38,6 +43,16 @@ def context(order_id="A-1001", amount=40):
 
 
 class SdkTests(unittest.TestCase):
+    def assert_documentation_targets_exist(self, path, text):
+        for target in documentation_targets(text):
+            if target.startswith(REPOSITORY_BLOB):
+                resolved = ROOT / target.removeprefix(REPOSITORY_BLOB)
+            elif target.startswith("https://"):
+                continue
+            else:
+                resolved = path.parent / target
+            self.assertTrue(resolved.resolve().exists(), target)
+
     def test_activation_reuse_and_unbound_point(self):
         policy = ActivatedPolicy(str(EXAMPLE / "limits.yaml"))
         self.assertEqual(policy.intervention_points, ("pre_tool_call",))
@@ -63,6 +78,24 @@ class SdkTests(unittest.TestCase):
         policy = ActivatedPolicy(str(EXAMPLE / "limits.yaml"))
         with self.assertRaises(TypeError):
             policy.evaluate("pre_tool_call", {"not_json": object()})
+        interceptor = AcsInterceptor(str(EXAMPLE / "limits.yaml"))
+        with self.assertRaises(TypeError):
+            interceptor.intercept(context(amount=object()))
+
+    def test_interceptor_unknown_and_missing_points_return_denials(self):
+        interceptor = AcsInterceptor(str(EXAMPLE / "limits.yaml"))
+        for point in ("typo", None):
+            with self.subTest(point=point):
+                ctx = context()
+                if point is None:
+                    del ctx["interception_point"]
+                else:
+                    ctx["interception_point"] = point
+                verdict = interceptor.intercept(ctx)
+                self.assertEqual(verdict.decision, Decision.DENY)
+                self.assertEqual(
+                    verdict.reason, "runtime_error:intervention_point_unknown"
+                )
 
     def test_sdk_readme_python_blocks(self):
         readme = (ROOT / "sdk/python/README.md").read_text()
@@ -92,9 +125,29 @@ class SdkTests(unittest.TestCase):
             "examples/python_composition/README.md",
         ):
             path = ROOT / relative
-            for target in re.findall(r"\]\(([^)#]+)\)", path.read_text()):
-                if not target.startswith("https://"):
-                    self.assertTrue((path.parent / target).resolve().exists(), target)
+            self.assert_documentation_targets_exist(path, path.read_text())
+
+    def test_link_check_includes_paths_with_fragments(self):
+        path = ROOT / "docs/ACS-AND-AGENT-HOOKS.md"
+        self.assert_documentation_targets_exist(
+            path, "[activation](../sdk/python/README.md#activating-a-policy-version)"
+        )
+        self.assertEqual(
+            documentation_targets("[missing](missing-file.md#heading)"),
+            ["missing-file.md"],
+        )
+        with self.assertRaises(AssertionError):
+            self.assert_documentation_targets_exist(
+                path, "[missing](missing-file.md#heading)"
+            )
+
+    def test_sdk_readme_links_work_from_pypi(self):
+        path = ROOT / "sdk/python/README.md"
+        targets = documentation_targets(path.read_text())
+        self.assertGreaterEqual(len(targets), 3)
+        for target in targets:
+            self.assertTrue(target.startswith("https://"), target)
+        self.assert_documentation_targets_exist(path, path.read_text())
 
     def test_composition_guide_is_a_complete_integration(self):
         guide = (ROOT / "docs/ACS-AND-AGENT-HOOKS.md").read_text()
@@ -110,6 +163,17 @@ class SdkTests(unittest.TestCase):
             "{'order_id': 'A-1001', 'amount': 40}\n"
             "assert issue_refund.call_args_list[1].kwargs == "
             "{'order_id': 'A-1003', 'amount': 100}\n"
+            "assert emitter.results == []\n"
+            "assert emitter.records_dropped == 0\n"
+            "try:\n"
+            "    asyncio.run(guarded_refund('bad-json', 'A-1001', object()))\n"
+            "except TypeError:\n"
+            "    pass\n"
+            "else:\n"
+            "    raise AssertionError('unserializable arguments must propagate an error')\n"
+            "assert issue_refund.call_count == 2\n"
+            "assert len(ledger) == 2\n"
+            "assert emitter.results == []\n"
         )
         result = subprocess.run(
             [
@@ -230,6 +294,45 @@ class CompositionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(record.verdicts), 2)
         self.assertEqual(self.ledger, [])
 
+    async def test_unserializable_input_raises_without_effect_or_record(self):
+        with self.assertRaises(TypeError):
+            await refund(self.emitter, context(amount=object()), self.ledger)
+        self.assertEqual(self.ledger, [])
+        self.assertEqual(self.emitter.results, [])
+
+    async def test_record_buffer_is_bounded_and_can_be_drained(self):
+        builder = AgentContextBuilder(
+            agent_id="a", framework="test", session_id="retention"
+        )
+        for number in range(500):
+            ctx = builder.pre_tool_call(
+                call_id=str(number),
+                name="issue_refund",
+                args={"order_id": "A-1001", "amount": 40},
+            )
+            await refund(self.emitter, ctx, self.ledger)
+        self.assertEqual(len(self.emitter.results), 100)
+        self.assertEqual(self.emitter.records_dropped, 400)
+        drained = self.emitter.take_records()
+        self.assertEqual([r.sequence for r in drained], list(range(400, 500)))
+        self.assertEqual(self.emitter.results, [])
+        self.assertEqual(len(self.ledger), 500)
+
+    async def test_draining_each_call_retains_no_copies_and_drops_nothing(self):
+        builder = AgentContextBuilder(
+            agent_id="a", framework="test", session_id="drain"
+        )
+        for number in range(500):
+            ctx = builder.pre_tool_call(
+                call_id=str(number),
+                name="issue_refund",
+                args={"order_id": "A-1001", "amount": 40},
+            )
+            record = await refund(self.emitter, ctx, self.ledger)
+            self.assertEqual(self.emitter.take_records(), [record])
+            self.assertEqual(self.emitter.results, [])
+        self.assertEqual(self.emitter.records_dropped, 0)
+
     async def test_approval_profiles(self):
         class Approver:
             calls = 0
@@ -320,6 +423,8 @@ class CompositionTests(unittest.IsolatedAsyncioTestCase):
             await main(self.emitter)
         self.assertIn("deny: combined=deny, proceeds=False", output.getvalue())
         self.assertIn("transform: combined=transform, proceeds=True", output.getvalue())
+        self.assertEqual(self.emitter.results, [])
+        self.assertEqual(self.emitter.records_dropped, 0)
 
 
 if __name__ == "__main__":

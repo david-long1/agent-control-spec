@@ -28,6 +28,7 @@ def make_emitter() -> InterceptionEmitter:
     )
     emitter.register(AcsInterceptor(str(EXAMPLE / "limits.yaml")), "limits")
     emitter.register(AcsInterceptor(str(EXAMPLE / "orders.yaml")), "orders")
+    emitter.set_max_records(100)
     return emitter
 
 
@@ -72,6 +73,7 @@ async def main(emitter: InterceptionEmitter) -> None:
             f"{call_id}: combined={record.verdict.decision.value}, "
             f"proceeds={record.proceeds}, controls={', '.join(contributions)}"
         )
+        emitter.take_records()
     assert ledger == [
         {"order_id": "A-1001", "amount": 40},
         {"order_id": "A-1003", "amount": 100},

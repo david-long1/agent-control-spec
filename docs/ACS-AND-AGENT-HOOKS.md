@@ -66,10 +66,12 @@ The [limits manifest](../examples/python_composition/limits.yaml) and
 `input.policy_target.value.amount`. When adapting the example, keep the
 context shape, manifest paths, tool catalog, and policy field names aligned.
 
-Both manifests bind `pre_tool_call` only. If your host emits other points,
-bind policies for those points or explicitly scope each ACS control.
-An unbound point is a denial, not an implicit pass. Scoping ACS must not
-disable other controls registered for that point.
+Both manifests bind `pre_tool_call` only, so send only that point to this
+emitter. For other points, use dedicated emitters containing the controls
+that bind them, or extend every manifest to cover all points a shared
+emitter receives. An unbound point is a denial, not an implicit pass.
+Returning allow from a scope wrapper would attribute a decision to a
+policy that never evaluated the context; alone at a point, it is a permit.
 
 ## 3. Register the policies in the order they should run
 
@@ -87,7 +89,14 @@ emitter = InterceptionEmitter(
 )
 emitter.register(AcsInterceptor(str(policies / "limits.yaml")), "limits")
 emitter.register(AcsInterceptor(str(policies / "orders.yaml")), "orders")
+emitter.set_max_records(100)
 ```
+
+The emitter retains records even when it returns them to the caller.
+This bound prevents unbounded growth; step 5 drains the buffer after
+each handled call. For durable audit, connect `set_record_sink` to your
+application's audit transport. A bounded buffer or console output is not
+durable storage.
 
 The limits policy rejects invalid amounts and caps positive amounts at 100.
 The orders policy permits `A-1001` and `A-1003` only for a positive amount
@@ -132,6 +141,9 @@ permission, it passes `outcome.target`, which contains any applied
 transformation. Passing the original `amount` would bypass the cap.
 In your application, handle the blocked result as a refused tool call,
 not as a reason to retry without the hook.
+Other exceptions from `emit()` also prevent execution and may produce no
+record. Let your dispatcher report those errors; it must not retry the
+operation without the hook.
 
 Keep `ENFORCE` for this path. `EVALUATE_ONLY` records decisions without
 blocking calls or applying transforms. Evaluation errors fail closed;
@@ -158,6 +170,7 @@ async def run():
         record = await guarded_refund(call_id, order_id, amount)
         print(call_id, record.verdict.decision.value, record.proceeds)
         print([(v.name, v.decision.value) for v in record.verdicts])
+        emitter.take_records()
 
     assert ledger == [
         {"order_id": "A-1001", "amount": 40},
@@ -176,7 +189,8 @@ and an allow from `orders`; the operation receives 100 rather than 150.
 `record.verdict` is the combined decision. `record.verdicts` identifies the
 contributing controls and their decisions. Check both, but also test the
 operation itself: a denial must mean zero invocations, and a transform must
-change the arguments received. The
+change the arguments received. `take_records()` drains the retained copies
+after this example handles the returned record. The
 [example and tests](../examples/python_composition/README.md) exercise these
 conditions using the published packages.
 

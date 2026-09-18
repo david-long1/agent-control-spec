@@ -18,10 +18,12 @@ They also check transform visibility, denied invocations, evaluation errors,
 unbound points, and approval stop/resume behavior. No private service,
 annotator, or paid model is required.
 
-Tested in a clean environment with published `agent-control-spec==0.4.0a3`,
-`agent-hooks-sdk==0.1.0a5`, and CPython 3.12.3 on Linux x86-64.
-The Python CI job runs these tests in a separate environment with the
-published package, rather than the checkout's native build.
+The example was verified with published ACS `0.4.0a3`, Agent Hooks
+`0.1.0a5`, and CPython 3.12.3 on Linux x86-64. To reproduce that baseline,
+install `examples/python_composition/requirements.txt` in a clean environment.
+The Python CI job runs these tests against both the checkout's native build
+and the published baseline. The consumer pin is maintained after publication
+as described in [RELEASING.md](../../RELEASING.md).
 
 The example isolates `pre_tool_call` to show how to add enforcement at
 one dispatch boundary. A complete host must retain its other lifecycle

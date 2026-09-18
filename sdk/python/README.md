@@ -8,16 +8,16 @@ interceptor.
 ```bash
 python3 -m venv .venv
 . .venv/bin/activate
-python -m pip install "agent-control-spec==0.4.0a3"
+python -m pip install --pre agent-control-spec
 python -m pip check
 ```
 
-ACS requires Python 3.11 or newer. The command installs the published
-`agent-control-spec==0.4.0a3` and its pinned dependency,
-`agent-hooks-sdk==0.1.0a5`. Use normal dependency resolution, not `--no-deps`.
+ACS requires Python 3.11 or newer. `--pre` includes prereleases.
+Use normal dependency resolution, not `--no-deps`.
 
-From this repository's root, run the complete
-[two-policy example](../../examples/python_composition/README.md):
+The example files are not included in the wheel. From the repository root,
+run the complete
+[two-policy example](https://github.com/responsibleai/agent-control-spec/blob/main/examples/python_composition/README.md):
 
 ```bash
 python examples/python_composition/compose.py
@@ -26,7 +26,7 @@ python -m unittest discover -s examples/python_composition -v
 
 It includes both manifests, their Rego policies, an evaluation context,
 and an inert operation. For the composition logic, see
-[ACS and Agent Hooks](../../docs/ACS-AND-AGENT-HOOKS.md).
+[ACS and Agent Hooks](https://github.com/responsibleai/agent-control-spec/blob/main/docs/ACS-AND-AGENT-HOOKS.md).
 
 The Python snippets below build on one another. Run them in the same
 interpreter from the repository root. First, register one policy:
@@ -43,9 +43,10 @@ The manifest binds policies (Rego and Cedar through their built-in
 evaluators, or `test` doubles) to interception points; the
 runtime evaluates each context and returns an agent-hooks verdict.
 Evaluation failures normalize into fail-closed `deny` verdicts with
-`runtime_error:*` reasons. Construction can raise on loading errors;
-invalid point names and unserializable contexts can also raise.
-Do not catch these failures and return an allow.
+`runtime_error:*` reasons. Construction raises on loading errors, and
+`intercept()` raises if the context cannot be serialized. An unknown or
+missing point name in that context returns a fail-closed deny.
+Do not catch failures and return an allow.
 
 ## Activating a policy version
 
@@ -98,18 +99,18 @@ fail-closed, including for a point the version does not bind; only
 boundary problems (an unknown point name, a context that will not
 serialize) raise. A known unbound point returns
 `runtime_error:intervention_point_unknown`. Read
-`policy.intervention_points` or `policy.governs(point)` and either bind
-all points needed by the host or explicitly scope that control. Do not
-skip other controls at an unbound point.
+`policy.intervention_points` or `policy.governs(point)` to inspect an
+activation's scope. These methods belong to `ActivatedPolicy`, not
+`AcsInterceptor`. When registering interceptors, either bind every point
+the emitter receives or use a dedicated emitter for each point, containing
+the controls that bind it.
 
 `evaluate()` and `AcsInterceptor.intercept()` are synchronous. GIL
 release is not an asyncio yield, and the emitter's timeout cannot
 preempt an inline synchronous call. In an async service, offload
 evaluation with bounded admission and drain outstanding work at shutdown;
-cancelling the await does not stop the worker. The proposed
-[`AsyncAcsInterceptor`](https://github.com/responsibleai/agent-control-spec/pull/68)
-is not in the pinned release. The `AcsInterceptor` GIL fix is on `main`
-but absent from that release; neither version makes interception async.
+cancelling the await does not stop the worker. This release does not provide
+an async interceptor.
 
 The supplied policies have no annotators. A manifest that opts into
 bundled annotators can make network requests during evaluation.
