@@ -17,6 +17,13 @@ tags are rejected on scalars and collections. Duplicate keys are rejected,
 including in dynamic metadata and adapter configuration. `<<` is an ordinary
 key, not merge expansion. Exactly one document is accepted.
 
+`intervention_points` may be omitted or an empty mapping, but not null.
+Unknown reserved directives (for example `%FOO bar`) are ignored. The tested
+parser accepts colon-tab value separation, tabs after a sequence dash, and a
+tab after spaces before a mapping key. A tab at the start of block indentation
+is rejected; this is not a blanket rejection of every indentation tab.
+A leading UTF-8 BOM is accepted; a BOM between document fields is rejected.
+
 ## Host-controlled budgets
 
 | `Limits` field | Default | Meaning |
@@ -24,7 +31,7 @@ key, not merge expansion. Exactly one document is accepted.
 | `max_merged_manifest_bytes` | 1,048,576 | Each source, expanded YAML scalar bytes, retained anchor string bytes, and serialized composed manifest |
 | `max_manifest_depth` | 64 | YAML collection depth and alias replay stack depth |
 | `max_manifest_nodes` | 100,000 | Expanded YAML nodes, including mapping keys |
-| `max_manifest_events` | 300,000 | Each of scan-event and alias-replay-event budgets |
+| `max_manifest_events` | 300,000 | Each of scan-event and alias-replay-event budgets; comments excluded |
 | `max_manifest_aliases` | 50,000 | Alias references and expansions of each anchor |
 | `max_manifest_anchors` | 50,000 | Anchor definitions |
 | `max_manifest_anchor_events` | 10,000 | Cumulative event copies retained for anchors, including nested retention |
@@ -33,6 +40,9 @@ The lower retained-event budget rejects compact exponentially expanding anchors
 early; hosts with large legitimate anchors can raise it. Repeated use of one
 small anchor is allowed without an alias/anchor ratio heuristic. Expanded
 nodes, scalar bytes and replay events are still charged independently.
+Every anchor retains at least one event, so the default retained-event budget
+also constrains the effective anchor count to at most 10,000, below the nominal
+50,000 definition limit. Larger anchors can reach that budget sooner.
 YAML simple keys retain the language's 1,024-character lookahead bound.
 Includes and property interpolation are not enabled.
 
@@ -41,6 +51,9 @@ Includes and property interpolation are not enabled.
 stops at `max_merged_manifest_bytes + 1` before parsing, for JSON as well as YAML.
 The legacy JSON decoder retains its own recursion limit; the YAML-specific
 node/event/depth budgets do not change that decoder's contract.
+Text chains intentionally enforce the serialized composed-size cap as well as
+each source's cap. Two individually admissible overlays can therefore exceed
+`max_merged_manifest_bytes` when combined, including through SDK merge APIs.
 
 Rust callers can use `Manifest::parse_yaml_str_with_limits` (no semantic
 validation), `from_yaml_str_with_limits` (validation), or
@@ -60,7 +73,15 @@ Grammar errors are `ManifestInvalid`; budget exhaustion is
 path (not `ManifestInvalidError`); Node throws a boundary error rather than
 returning a grammar verdict; C returns `ACS_MANIFEST_CALL_FAILED`, which .NET
 maps to `AgentControlSpecNativeException`. Detailed diagnostic callers likewise
-must not mistake resource failures for a grammar verdict.
+receive boundary failures rather than findings for manifest parsing limits,
+including artifact validation. FFI diagnostic functions return null and set
+`err_out`; .NET `AcsManifestTools.Diagnostics` and `ValidateArtifacts` throw.
+Diagnostic APIs without a limits argument retain the default budgets.
+Python and Node parse, validate and merge exceptions retain the
+`runtime_error:manifest_invalid:` prefix; structured findings keep the reason
+in their separate `code` field. Budget messages name the count and limit field,
+without Rust debug variants or repeated anchor locations. Unknown path segments
+and the root placeholder are omitted, not literal punctuation in mapping keys.
 
 ## Dependency and MSRV evidence
 
@@ -73,7 +94,7 @@ Verified against registry metadata on September 18, 2026:
 | `serde_path_to_error` | 0.1.20 | 2025-09-15 15:05:54.817744 | 1.61 |
 
 The granit patch was older than seven full days when selected. It fixes colon-tab
-separation without allowing indentation tabs. Both Cargo lockfiles record the
+separation; the tab leniencies above are pinned by regressions. Both Cargo lockfiles record the
 registry checksum. Version 1.3 releases from September 16 were not selected.
 The published manifest follows the repository's caret convention; lockfiles,
 not an exact published dependency constraint, select the tested parser versions.

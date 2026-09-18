@@ -603,7 +603,7 @@ pub fn validate_manifest(
     let source = decode("source", &source)?;
     let manifest = match Manifest::parse_yaml_str_with_limits(&source, parse_limits(limits_json)?) {
         Ok(m) => m,
-        Err(RuntimeError::ManifestInvalid(detail)) => return Ok(Some(detail)),
+        Err(error @ RuntimeError::ManifestInvalid(_)) => return Ok(Some(format!("{error}"))),
         Err(other) => return Err(err(format!("{other}"))),
     };
     if !manifest.extends.is_empty() {
@@ -782,7 +782,8 @@ pub fn validate_artifacts_detailed(
     // is owned by the core so every binding renders artifact findings
     // the same way.
     let findings = match Manifest::from_yaml_str(&manifest_yaml) {
-        Err(e) => vec![wire::diagnostic_json(&e)],
+        Err(e @ RuntimeError::ManifestInvalid(_)) => vec![wire::diagnostic_json(&e)],
+        Err(other) => return Err(err(format!("{other}"))),
         Ok(manifest) => match manifest.validate() {
             Err(e) => vec![wire::diagnostic_json(&e)],
             Ok(()) => match ActivatedPolicy::activate_from_memory(&manifest_yaml, bundles) {

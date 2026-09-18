@@ -110,7 +110,8 @@ public static class AcsManifestTools
     /// <remarks>
     /// <see cref="AcsManifest.Validate"/> answers yes or no by throwing,
     /// which a linter cannot render against a document. This returns the
-    /// findings instead.
+    /// findings instead. Manifest parsing resource limits still throw
+    /// <see cref="AgentControlSpecNativeException"/>.
     /// </remarks>
     public static IReadOnlyList<ManifestDiagnostic> Diagnostics(string yaml) =>
         JsonSerializer.Deserialize<List<ManifestDiagnostic>>(Native.ManifestDiagnostics(yaml), Json)
@@ -134,6 +135,8 @@ public static class AcsManifestTools
     /// at activation, so this activates in memory and reports what that
     /// surfaced, which moves the failure from a host's first agent action
     /// to its CI.
+    /// Manifest parsing resource limits throw
+    /// <see cref="AgentControlSpecNativeException"/> rather than returning findings.
     /// </remarks>
     public static IReadOnlyList<ManifestDiagnostic> ValidateArtifacts(
         string manifestYaml, string? bundles = null) =>

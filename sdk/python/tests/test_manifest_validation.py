@@ -53,6 +53,41 @@ def test_unsupported_version_is_rejected_with_the_engine_message():
     assert "0.3.1-beta" in str(excinfo.value)
 
 
+def test_diagnostics_do_not_relabel_resource_failures_as_findings():
+    from agent_control_spec import validate_artifacts, validate_manifest_detailed
+
+    for operation in [validate_artifacts, validate_manifest_detailed]:
+        for source in [
+            VALID + "\n# " + "x" * 1_048_576,
+            "agent_control_specification_version: 0.4.0-alpha.1\nmetadata: "
+            + "[" * 65
+            + "0"
+            + "]" * 65,
+        ]:
+            with pytest.raises(
+                ValueError, match="^runtime_error:resource_limit_exceeded:"
+            ) as error:
+                operation(source)
+            assert not isinstance(error.value, ManifestInvalidError)
+        assert operation("x: [")[0]["code"] == "runtime_error:manifest_invalid"
+
+
+def test_parse_and_validate_errors_keep_the_runtime_reason_prefix():
+    from agent_control_spec import merge_manifests, parse_manifest
+
+    for operation in [
+        validate_manifest,
+        parse_manifest,
+        lambda source: merge_manifests([source]),
+    ]:
+        with pytest.raises(ValueError, match="^runtime_error:manifest_invalid:"):
+            operation("x: [")
+    for operation in [validate_manifest, lambda source: merge_manifests([source])]:
+        for source in [VALID.replace('"0.4.0-alpha.1"', '"0.3.1-beta"')]:
+            with pytest.raises(ValueError, match="^runtime_error:manifest_invalid:"):
+                operation(source)
+
+
 def test_unknown_path_root_is_rejected():
     # `$policy_target` was the pre-0.4 root and the grammar no longer
     # accepts it, which is exactly the class of error a migration tool

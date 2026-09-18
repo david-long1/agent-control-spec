@@ -557,7 +557,7 @@ fn validate_manifest(source: &str, limits: Option<Py<PyAny>>) -> PyResult<()> {
 
 fn manifest_error(error: RuntimeError) -> PyErr {
     match error {
-        RuntimeError::ManifestInvalid(detail) => ManifestInvalid::new_err(detail),
+        error @ RuntimeError::ManifestInvalid(_) => ManifestInvalid::new_err(format!("{error}")),
         other => PyValueError::new_err(format!("{other}")),
     }
 }
@@ -623,12 +623,8 @@ fn parse_manifest(source: &str, limits: Option<Py<PyAny>>) -> PyResult<String> {
 #[pyo3(signature = (sources, limits=None))]
 fn merge_manifests(sources: Vec<String>, limits: Option<Py<PyAny>>) -> PyResult<String> {
     let refs: Vec<&str> = sources.iter().map(String::as_str).collect();
-    let manifest = Manifest::from_yaml_chain_with_limits(&refs, resolve_limits(limits)?).map_err(
-        |e| match e {
-            RuntimeError::ManifestInvalid(detail) => ManifestInvalid::new_err(detail),
-            other => PyValueError::new_err(format!("{other}")),
-        },
-    )?;
+    let manifest = Manifest::from_yaml_chain_with_limits(&refs, resolve_limits(limits)?)
+        .map_err(manifest_error)?;
     serde_json::to_string(&manifest)
         .map_err(|e| PyRuntimeError::new_err(format!("merged manifest serialization failed: {e}")))
 }
@@ -713,7 +709,8 @@ fn validate_artifacts_diagnostics(manifest_yaml: &str, bundles_json: &str) -> Py
     // failure. The diagnostic shape is owned by the core so every
     // binding renders artifact findings the same way.
     let findings = match Manifest::from_yaml_str(manifest_yaml) {
-        Err(e) => vec![wire::diagnostic_json(&e)],
+        Err(e @ RuntimeError::ManifestInvalid(_)) => vec![wire::diagnostic_json(&e)],
+        Err(other) => return Err(PyValueError::new_err(format!("{other}"))),
         Ok(manifest) => match manifest.validate() {
             Err(e) => vec![wire::diagnostic_json(&e)],
             Ok(()) => match ActivatedPolicy::activate_from_memory(manifest_yaml, bundles) {

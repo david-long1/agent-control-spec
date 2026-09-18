@@ -443,6 +443,8 @@ def validate_artifacts(
     Each diagnostic is ``{"code": str, "message": str, "severity":
     "error"}`` and matches the C ABI's ``acs_artifact_diagnostics``
     wire shape. An empty list means both halves are sound.
+    Manifest parsing resource limits raise ``ValueError`` rather than
+    returning a grammar finding.
 
     :func:`validate_manifest_detailed` answers only for the document.
     A manifest can satisfy the grammar, name a Rego bundle, and still

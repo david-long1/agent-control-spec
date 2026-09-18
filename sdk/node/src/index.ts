@@ -791,7 +791,7 @@ export function validateManifestDetailed(source: string, limits?: Readonly<Limit
  * the wrong half.
  *
  * Throws only on boundary problems (non-string manifest, unpaired
- * surrogate, non-object bundles); a broken manifest or Rego module
+ * surrogate, non-object bundles, manifest parsing resource limits); a broken manifest or Rego module
  * returns a non-empty array.
  */
 export function validateArtifacts(

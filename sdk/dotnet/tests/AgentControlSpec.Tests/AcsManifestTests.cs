@@ -48,6 +48,28 @@ public sealed class AcsManifestTests
     }
 
     [Fact]
+    public void DiagnosticEntryPointsThrowOnResourceFailures()
+    {
+        foreach (var operation in new Func<string, IReadOnlyList<ManifestDiagnostic>>[]
+        {
+            AcsManifestTools.Diagnostics,
+            text => AcsManifestTools.ValidateArtifacts(text),
+        })
+        {
+            foreach (var source in new[]
+            {
+                Valid + "\n# " + new string('x', 1_048_576),
+                "agent_control_specification_version: 0.4.0-alpha.1\nmetadata: " + new string('[', 65) + "0" + new string(']', 65),
+            })
+            {
+                var error = Assert.Throws<AgentControlSpecNativeException>(() => operation(source));
+                Assert.Contains("runtime_error:resource_limit_exceeded", error.Message);
+            }
+            Assert.Equal("runtime_error:manifest_invalid", Assert.Single(operation("x: [")).Code);
+        }
+    }
+
+    [Fact]
     public void UnsupportedVersionIsRejectedWithTheEngineMessage()
     {
         var source = Valid.Replace("\"0.4.0-alpha.1\"", "\"0.3.1-beta\"");

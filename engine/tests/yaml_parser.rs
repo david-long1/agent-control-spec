@@ -272,7 +272,191 @@ fn budgets_are_configurable_and_independent_from_policy_depth() {
     let source = format!("{MANIFEST}metadata: [{}]", vec!["x"; 300_001].join(","));
     let error = Manifest::parse_yaml_str(&source).unwrap_err();
     assert_eq!(error.reason(), "runtime_error:resource_limit_exceeded");
-    assert!(error.detail().contains("event limit"));
+    assert!(error.detail().contains("max_manifest_events limit"));
+}
+
+#[test]
+fn comments_do_not_consume_the_event_budget() {
+    let source = format!("{MANIFEST}{}", "#\n".repeat(301_000));
+    assert!(source.len() < Limits::default().max_merged_manifest_bytes);
+    assert_eq!(
+        Manifest::parse_yaml_str(&source).unwrap(),
+        Manifest::parse_yaml_str(MANIFEST).unwrap()
+    );
+}
+
+#[test]
+fn default_depth_boundary_is_64_for_flow_and_block_collections() {
+    for depth in [64, 65] {
+        let flow = format!(
+            "{MANIFEST}metadata: {}0{}",
+            "[".repeat(depth - 1),
+            "]".repeat(depth - 1)
+        );
+        let mut block = format!("{MANIFEST}metadata:\n");
+        for level in 1..depth {
+            block.push_str(&format!("{}v:\n", "  ".repeat(level)));
+        }
+        block.push_str(&format!("{}0\n", "  ".repeat(depth)));
+        for source in [flow, block] {
+            let result = Manifest::parse_yaml_str(&source);
+            if depth == 64 {
+                result.unwrap();
+            } else {
+                let error = result.unwrap_err();
+                assert_eq!(error.reason(), "runtime_error:resource_limit_exceeded");
+                assert!(
+                    error
+                        .detail()
+                        .contains("depth 65 exceeds max_manifest_depth limit 64"),
+                    "{error}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn retained_events_constrain_the_effective_anchor_count() {
+    let mut source = format!("{MANIFEST}metadata:\n");
+    for index in 0..10_001 {
+        source.push_str(&format!("  k{index}: &a{index} x\n"));
+    }
+    let error = Manifest::parse_yaml_str(&source).unwrap_err();
+    assert_eq!(error.reason(), "runtime_error:resource_limit_exceeded");
+    assert!(
+        error.detail().contains(
+            "retained anchor events 10001 exceeds max_manifest_anchor_events limit 10000"
+        ),
+        "{error}"
+    );
+    Manifest::parse_yaml_str_with_limits(
+        &source,
+        Limits {
+            max_manifest_anchor_events: 20_000,
+            ..Limits::default()
+        },
+    )
+    .unwrap();
+}
+
+#[test]
+fn text_chains_bound_the_combined_serialized_manifest() {
+    let first = format!("{MANIFEST}metadata: {{first: {}}}", "x".repeat(600_000));
+    let second = format!("{MANIFEST}metadata: {{second: {}}}", "y".repeat(600_000));
+    for source in [&first, &second] {
+        Manifest::from_yaml_str(source).unwrap();
+        Manifest::from_yaml_chain(&[source]).unwrap();
+    }
+    let error = Manifest::from_yaml_chain(&[&first, &second]).unwrap_err();
+    assert_eq!(error.reason(), "runtime_error:resource_limit_exceeded");
+    assert!(
+        error.detail().contains("merged manifest serialized size"),
+        "{error}"
+    );
+    let merged = Manifest::from_yaml_chain_with_limits(
+        &[&first, &second],
+        Limits {
+            max_merged_manifest_bytes: 2_097_152,
+            ..Limits::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(merged.metadata["first"].as_str().unwrap().len(), 600_000);
+    assert_eq!(merged.metadata["second"].as_str().unwrap().len(), 600_000);
+}
+
+#[test]
+fn intervention_points_null_is_not_an_empty_mapping() {
+    for null in ["null", "~", "", "!!null \"\""] {
+        let source = format!(
+            "agent_control_specification_version: 0.4.0-alpha.1\nintervention_points: {null}\n"
+        );
+        let error = Manifest::parse_yaml_str(&source).unwrap_err();
+        assert_eq!(error.reason(), "runtime_error:manifest_invalid");
+        assert!(error.detail().contains("intervention_points"), "{error}");
+    }
+    Manifest::parse_yaml_str(
+        "agent_control_specification_version: 0.4.0-alpha.1\nintervention_points: {}",
+    )
+    .unwrap();
+    Manifest::parse_yaml_str("agent_control_specification_version: 0.4.0-alpha.1").unwrap();
+}
+
+#[test]
+fn reserved_directives_and_some_tab_separators_are_ignored() {
+    let expected = Manifest::parse_yaml_str(MANIFEST).unwrap();
+    assert_eq!(
+        Manifest::parse_yaml_str(&format!("%FOO bar\n---\n{MANIFEST}")).unwrap(),
+        expected
+    );
+    for source in [
+        format!("{MANIFEST}metadata:\n  \tvalue: 1\n"),
+        format!("{MANIFEST}metadata:\n  values:\n    -\t1\n"),
+    ] {
+        let parsed = Manifest::parse_yaml_str(&source).unwrap();
+        assert!(
+            parsed.metadata == json!({"value": 1}) || parsed.metadata == json!({"values": [1]})
+        );
+    }
+    assert!(Manifest::parse_yaml_str(&format!("{MANIFEST}metadata:\n\tvalue: 1")).is_err());
+}
+
+#[test]
+fn diagnostic_paths_drop_only_unknown_segments_and_root_markers() {
+    let error = Manifest::parse_yaml_str("[]").unwrap_err();
+    assert!(!error.detail().starts_with(".: "), "{error}");
+    let error = Manifest::parse_yaml_str(&format!("{MANIFEST}metadata: {{1: value}}")).unwrap_err();
+    assert!(error.detail().starts_with("metadata: "), "{error}");
+    for key in ["?", ".", "a?b.c"] {
+        let source = format!("{MANIFEST}metadata: {{\"{key}\": .inf}}");
+        let error = Manifest::parse_yaml_str(&source).unwrap_err();
+        assert!(
+            error.detail().starts_with(&format!("metadata.{key}: ")),
+            "{error}"
+        );
+    }
+    let error = Manifest::parse_yaml_str(&format!("{MANIFEST}extends: [{{path: parent.yaml}}]"))
+        .unwrap_err();
+    assert!(error.detail().starts_with("extends[0].path: "), "{error}");
+    assert_eq!(error.detail().matches("extends").count(), 1, "{error}");
+    assert_eq!(error.detail().matches("at line").count(), 1, "{error}");
+}
+
+#[test]
+fn budget_diagnostics_are_concise_actionable_and_not_debug_text() {
+    let mut bomb = format!("{MANIFEST}metadata:\n  a0: &a0 [x, x]\n");
+    for index in 1..20 {
+        bomb.push_str(&format!(
+            "  a{index}: &a{index} [*a{}, *a{}]\n",
+            index - 1,
+            index - 1
+        ));
+    }
+    for (source, limits, expected) in [
+        (
+            MANIFEST.to_string(),
+            Limits {
+                max_manifest_nodes: 1,
+                ..Limits::default()
+            },
+            "nodes 2 exceeds max_manifest_nodes limit 1",
+        ),
+        (
+            bomb,
+            Limits::default(),
+            "retained anchor events 10001 exceeds max_manifest_anchor_events limit 10000",
+        ),
+    ] {
+        let error = Manifest::parse_yaml_str_with_limits(&source, limits).unwrap_err();
+        assert_eq!(error.reason(), "runtime_error:resource_limit_exceeded");
+        assert!(error.detail().contains(expected), "{error}");
+        assert!(error.detail().matches("at line").count() <= 1, "{error}");
+        assert!(error.detail().len() < 350, "{error}");
+        for internal in ["Nodes {", "RecordedAnchorEvents", "defined at", "\n"] {
+            assert!(!error.detail().contains(internal), "{error}");
+        }
+    }
 }
 
 #[test]

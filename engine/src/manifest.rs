@@ -28,7 +28,7 @@ pub struct Manifest {
     pub agent_control_specification_version: String,
     #[serde(default = "empty_object")]
     pub metadata: JsonValue,
-    #[serde(default, deserialize_with = "deserialize_extends")]
+    #[serde(default)]
     pub extends: Vec<ManifestExtends>,
     #[serde(default)]
     pub policies: BTreeMap<String, PolicyConfig>,
@@ -230,15 +230,128 @@ fn deserialize_intervention_points<'de, D: serde::Deserializer<'de>>(
             Ok(points)
         }
     }
-    deserializer.deserialize_map(PointsVisitor)
+    deserializer.deserialize_any(PointsVisitor)
 }
 
-fn deserialize_extends<'de, D>(deserializer: D) -> Result<Vec<ManifestExtends>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    Vec::deserialize(deserializer)
-        .map_err(|error| serde::de::Error::custom(format!("extends: {error}")))
+fn manifest_error_path(path: &serde_path_to_error::Path) -> String {
+    use serde_path_to_error::Segment;
+    let mut output = String::new();
+    for segment in path {
+        match segment {
+            Segment::Unknown => {}
+            Segment::Seq { index } => output.push_str(&format!("[{index}]")),
+            Segment::Map { key } | Segment::Enum { variant: key } => {
+                if !output.is_empty() {
+                    output.push('.');
+                }
+                output.push_str(key);
+            }
+        }
+    }
+    output
+}
+
+fn manifest_limit_message(kind: &str, count: usize, field: &str, limit: usize) -> String {
+    format!("manifest {kind} {count} exceeds {field} limit {limit}")
+}
+
+fn manifest_budget_message(
+    error: &serde_saphyr::Error,
+    reported: Option<&serde_saphyr::budget::BudgetBreach>,
+    limits: Limits,
+) -> Option<String> {
+    use serde_saphyr::{budget::BudgetBreach, Error};
+    let breach = reported.or(match error {
+        Error::Budget { breach, .. } => Some(breach),
+        _ => None,
+    });
+    let (kind, count, field, limit) = if let Some(breach) = breach {
+        match *breach {
+            BudgetBreach::Events { events } => (
+                "events",
+                events,
+                "max_manifest_events",
+                limits.max_manifest_events,
+            ),
+            BudgetBreach::Aliases { aliases } => (
+                "aliases",
+                aliases,
+                "max_manifest_aliases",
+                limits.max_manifest_aliases,
+            ),
+            BudgetBreach::Anchors { anchors } => (
+                "anchors",
+                anchors,
+                "max_manifest_anchors",
+                limits.max_manifest_anchors,
+            ),
+            BudgetBreach::Depth { depth } => (
+                "depth",
+                depth,
+                "max_manifest_depth",
+                limits.max_manifest_depth,
+            ),
+            BudgetBreach::Nodes { nodes } => (
+                "nodes",
+                nodes,
+                "max_manifest_nodes",
+                limits.max_manifest_nodes,
+            ),
+            BudgetBreach::ScalarBytes { total_scalar_bytes } => (
+                "expanded scalar bytes",
+                total_scalar_bytes,
+                "max_merged_manifest_bytes",
+                limits.max_merged_manifest_bytes,
+            ),
+            BudgetBreach::RecordedAnchorEvents {
+                recorded_anchor_events,
+            } => (
+                "retained anchor events",
+                recorded_anchor_events,
+                "max_manifest_anchor_events",
+                limits.max_manifest_anchor_events,
+            ),
+            BudgetBreach::RecordedAnchorBytes {
+                recorded_anchor_bytes,
+            } => (
+                "retained anchor bytes",
+                recorded_anchor_bytes,
+                "max_merged_manifest_bytes",
+                limits.max_merged_manifest_bytes,
+            ),
+            // Disabled features cannot charge their budgets. Keep future parser
+            // limits fail-closed without exposing their Debug representation.
+            _ => return Some("manifest exceeds a parser resource limit".to_string()),
+        }
+    } else {
+        match *error {
+            Error::AliasReplayLimitExceeded {
+                total_replayed_events,
+                max_total_replayed_events,
+                ..
+            } => (
+                "replayed events",
+                total_replayed_events,
+                "max_manifest_events",
+                max_total_replayed_events,
+            ),
+            Error::AliasExpansionLimitExceeded {
+                expansions,
+                max_expansions_per_anchor,
+                ..
+            } => (
+                "anchor expansions",
+                expansions,
+                "max_manifest_aliases",
+                max_expansions_per_anchor,
+            ),
+            Error::AliasReplayStackDepthExceeded {
+                depth, max_depth, ..
+            } => ("alias replay depth", depth, "max_manifest_depth", max_depth),
+            _ => return None,
+        }
+    };
+    Some(manifest_limit_message(kind, count, field, limit))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -705,13 +818,16 @@ impl Manifest {
     /// Policy input/output depth does not affect manifest parsing.
     pub fn parse_yaml_str_with_limits(input: &str, limits: Limits) -> Result<Self, RuntimeError> {
         if input.len() > limits.max_merged_manifest_bytes {
-            return Err(RuntimeError::ResourceLimitExceeded(
-                "manifest source exceeds the byte limit".to_string(),
-            ));
+            return Err(RuntimeError::ResourceLimitExceeded(manifest_limit_message(
+                "source bytes",
+                input.len(),
+                "max_merged_manifest_bytes",
+                limits.max_merged_manifest_bytes,
+            )));
         }
         let normalized = preserve_scalar_types(input, limits)?;
         // Alias diagnostics can wrap the typed error. Use the structured budget report.
-        let parser_limit = std::rc::Rc::new(std::cell::Cell::new(false));
+        let parser_limit = std::rc::Rc::new(std::cell::RefCell::new(None));
         let reported_limit = std::rc::Rc::clone(&parser_limit);
         let mut path = serde_path_to_error::Track::new();
         serde_saphyr::with_deserializer_from_str_with_options(
@@ -724,6 +840,7 @@ impl Manifest {
                 duplicate_keys: serde_saphyr::DuplicateKeyPolicy::Error,
                 merge_keys: serde_saphyr::MergeKeyPolicy::AsOrdinary,
                 with_snippet: false,
+                emit_comments: false,
                 alias_limits: serde_saphyr::alias_limits! {
                     max_total_replayed_events: limits.max_manifest_events,
                     max_replay_stack_depth: limits.max_manifest_depth,
@@ -745,7 +862,7 @@ impl Manifest {
                 },
             }
             .with_budget_report(move |report| {
-                reported_limit.set(report.breached.is_some());
+                *reported_limit.borrow_mut() = report.breached.clone();
             }),
             |de| {
                 Self::deserialize(serde_path_to_error::Deserializer::new(
@@ -755,23 +872,27 @@ impl Manifest {
             },
         )
         .map_err(|err| {
-            let detail = format!(
-                "{}: {}",
-                path.path(),
-                err.render_with_formatter(&serde_saphyr::UserMessageFormatter)
-            );
-            if parser_limit.get()
-                || matches!(
-                    err,
-                    serde_saphyr::Error::Budget { .. }
-                        | serde_saphyr::Error::AliasReplayLimitExceeded { .. }
-                        | serde_saphyr::Error::AliasExpansionLimitExceeded { .. }
-                        | serde_saphyr::Error::AliasReplayStackDepthExceeded { .. }
-                )
-            {
-                RuntimeError::ResourceLimitExceeded(detail)
+            let path = manifest_error_path(&path.path());
+            let prefix = if path.is_empty() {
+                String::new()
             } else {
-                RuntimeError::ManifestInvalid(detail)
+                format!("{path}: ")
+            };
+            if let Some(message) =
+                manifest_budget_message(&err, parser_limit.borrow().as_ref(), limits)
+            {
+                let location = err
+                    .location()
+                    .map(|location| {
+                        format!(" at line {}, column {}", location.line(), location.column())
+                    })
+                    .unwrap_or_default();
+                RuntimeError::ResourceLimitExceeded(format!("{prefix}{message}{location}"))
+            } else {
+                RuntimeError::ManifestInvalid(format!(
+                    "{prefix}{}",
+                    err.render_with_formatter(&serde_saphyr::UserMessageFormatter)
+                ))
             }
         })
     }
@@ -1603,13 +1724,19 @@ fn preserve_scalar_types(
     let mut documents = 0;
     for (events, event) in parser.enumerate() {
         if events >= limits.max_manifest_events {
-            return Err(RuntimeError::ResourceLimitExceeded(
-                "manifest parser event limit exceeded".to_string(),
-            ));
+            return Err(RuntimeError::ResourceLimitExceeded(manifest_limit_message(
+                "events",
+                events.saturating_add(1),
+                "max_manifest_events",
+                limits.max_manifest_events,
+            )));
         }
         let (event, span) = event.map_err(|error| {
             if matches!(error.kind(), ErrorKind::RecursionLimitExceeded) {
-                RuntimeError::ResourceLimitExceeded(error.to_string())
+                RuntimeError::ResourceLimitExceeded(format!(
+                    "manifest depth exceeds max_manifest_depth limit {}",
+                    limits.max_manifest_depth
+                ))
             } else {
                 RuntimeError::ManifestInvalid(error.to_string())
             }

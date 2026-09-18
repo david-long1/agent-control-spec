@@ -1355,9 +1355,17 @@ pub unsafe extern "C" fn acs_manifest_diagnostics(
         let findings = match Manifest::from_yaml_str(source) {
             Ok(manifest) => match manifest.validate() {
                 Ok(()) => Vec::new(),
-                Err(e) => vec![wire::diagnostic_json(&e)],
+                Err(e @ RuntimeError::ManifestInvalid(_)) => vec![wire::diagnostic_json(&e)],
+                Err(other) => {
+                    set_err(err_out, format!("{other}"));
+                    return std::ptr::null_mut();
+                }
             },
-            Err(e) => vec![wire::diagnostic_json(&e)],
+            Err(e @ RuntimeError::ManifestInvalid(_)) => vec![wire::diagnostic_json(&e)],
+            Err(other) => {
+                set_err(err_out, format!("{other}"));
+                return std::ptr::null_mut();
+            }
         };
         match serde_json::to_string(&findings) {
             Ok(json) => to_c_string(json, err_out),
@@ -1417,7 +1425,11 @@ pub unsafe extern "C" fn acs_artifact_diagnostics(
         // does not parse would otherwise be reported as an activation
         // failure, which names the wrong half.
         let findings = match Manifest::from_yaml_str(source) {
-            Err(e) => vec![wire::diagnostic_json(&e)],
+            Err(e @ RuntimeError::ManifestInvalid(_)) => vec![wire::diagnostic_json(&e)],
+            Err(other) => {
+                set_err(err_out, format!("{other}"));
+                return std::ptr::null_mut();
+            }
             Ok(manifest) => match manifest.validate() {
                 Err(e) => vec![wire::diagnostic_json(&e)],
                 Ok(()) => match ActivatedPolicy::activate_from_memory(source, bundles) {
@@ -2337,6 +2349,46 @@ intervention_points:
         };
         assert_eq!(code, ACS_MANIFEST_CALL_FAILED);
         unsafe { acs_free_string(error) };
+    }
+
+    #[test]
+    fn diagnostic_entry_points_do_not_report_resource_failures_as_findings() {
+        let oversized = format!("{}\n# {}", valid_manifest_source(), "x".repeat(1_048_576));
+        let excessive_depth = format!(
+            "agent_control_specification_version: 0.4.0-alpha.1\nmetadata: {}0{}",
+            "[".repeat(65),
+            "]".repeat(65)
+        );
+        for source in [&oversized, &excessive_depth, "x: ["] {
+            let source = CString::new(source.as_bytes()).unwrap();
+            for artifacts in [false, true] {
+                let mut error = std::ptr::null_mut();
+                let result = unsafe {
+                    if artifacts {
+                        acs_artifact_diagnostics(source.as_ptr(), std::ptr::null(), &mut error)
+                    } else {
+                        acs_manifest_diagnostics(source.as_ptr(), &mut error)
+                    }
+                };
+                if source.to_bytes() == b"x: [" {
+                    assert!(error.is_null());
+                    assert!(!result.is_null());
+                    let findings: serde_json::Value =
+                        serde_json::from_str(unsafe { CStr::from_ptr(result) }.to_str().unwrap())
+                            .unwrap();
+                    assert_eq!(findings[0]["code"], "runtime_error:manifest_invalid");
+                    unsafe { acs_free_string(result) };
+                } else {
+                    assert!(result.is_null());
+                    assert!(!error.is_null());
+                    assert!(unsafe { CStr::from_ptr(error) }
+                        .to_str()
+                        .unwrap()
+                        .contains("runtime_error:resource_limit_exceeded"));
+                    unsafe { acs_free_string(error) };
+                }
+            }
+        }
     }
 
     #[test]
