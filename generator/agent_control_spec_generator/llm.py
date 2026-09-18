@@ -51,10 +51,17 @@ class _DeadlineReader(io.RawIOBase):
         return True
 
     def readinto(self, buffer):
-        self._socket.settimeout(_remaining(self._deadline))
+        timeout = _remaining(self._deadline)
+        deadline_limited = timeout < REQUEST_TIMEOUT_SECONDS
+        self._socket.settimeout(timeout)
         try:
             size = self._raw.readinto(buffer)
         except TimeoutError:
+            # Socket timers and monotonic clocks can have different resolution
+            # (notably on Windows). Classify by the budget that limited this read,
+            # rather than requiring the clock to tick past the deadline first.
+            if deadline_limited:
+                raise _DeadlineExceeded from None
             _remaining(self._deadline)
             raise
         _remaining(self._deadline)

@@ -12,6 +12,7 @@ import time
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from agent_control_spec import ActivatedPolicy
@@ -126,7 +127,7 @@ def server(respond):
             self.rfile.read(int(self.headers.get("Content-Length", "0")))
             try:
                 respond(self)
-            except (BrokenPipeError, ConnectionResetError):
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
                 # Deadline tests intentionally close while the fixture is writing.
                 return
 
@@ -220,10 +221,11 @@ def test_trickle_cannot_outlive_absolute_response_deadline(monkeypatch, phase):
 
     with server(trickle) as (_, endpoint):
         started = time.monotonic()
-        with pytest.raises(llm.ProviderError, match="deadline"):
+        with pytest.raises(llm.ProviderError) as error:
             llm.OpenAICompatibleLanguageModel(
                 api_base=endpoint, api_key="TEST"
             ).complete("s", "u")
+        assert "deadline" in str(error.value), type(error.value.__context__).__name__
         assert time.monotonic() - started < 1
 
 
@@ -248,6 +250,30 @@ def test_transport_timeout_covers_a_stalled_response(monkeypatch):
         llm.OpenAICompatibleLanguageModel(api_base=endpoint, api_key="TEST").complete(
             "s", "u"
         )
+
+
+def test_shortened_socket_timeout_is_a_deadline_even_before_next_clock_tick(
+    monkeypatch,
+):
+    class TimedOut(io.BytesIO):
+        def readinto(self, buffer):
+            raise TimeoutError
+
+    class Socket:
+        def makefile(self, *args, **kwargs):
+            return TimedOut()
+
+        def settimeout(self, value):
+            self.timeout = value
+
+    monkeypatch.setattr(llm, "time", SimpleNamespace(monotonic=lambda: 0.999))
+    sock = Socket()
+    with (
+        llm._DeadlineReader(sock, deadline=1.0) as reader,
+        pytest.raises(llm._DeadlineExceeded),
+    ):
+        reader.readinto(bytearray(1))
+    assert 0 < sock.timeout < llm.REQUEST_TIMEOUT_SECONDS
 
 
 def test_provider_deadline_releases_the_output_lock(tmp_path, monkeypatch):
