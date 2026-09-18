@@ -196,12 +196,17 @@ public sealed class HostHooksTests : IDisposable
         Assert.Equal("runtime_error:annotation_failed", verdict.Reason);
     }
 
-    [Fact]
-    public void AnUndeclaredAnnotationReadIsRejectedBeforeDispatch()
+    [Theory]
+    [InlineData("\n")]
+    [InlineData("\r\n")]
+    public void AnUndeclaredAnnotationReadIsRejectedBeforeDispatch(string lineEnding)
     {
         var manifest = WriteChainedFixture();
-        File.WriteAllText(manifest, File.ReadAllText(manifest).Replace(
-            "        needs: [scan]\n", ""));
+        var source = File.ReadAllText(manifest).ReplaceLineEndings(lineEnding);
+        var normalized = source.ReplaceLineEndings("\n");
+        var invalid = normalized.Replace("        needs: [scan]\n", "");
+        Assert.NotEqual(normalized, invalid);
+        File.WriteAllText(manifest, invalid.ReplaceLineEndings(lineEnding));
         var calls = new List<string>();
 
         var error = Assert.Throws<AgentControlSpecNativeException>(() =>
@@ -224,13 +229,19 @@ public sealed class HostHooksTests : IDisposable
         Assert.Empty(calls);
     }
 
-    [Fact]
-    public void AnAnnotationDependencyCycleIsRejectedBeforeDispatch()
+    [Theory]
+    [InlineData("\n")]
+    [InlineData("\r\n")]
+    public void AnAnnotationDependencyCycleIsRejectedBeforeDispatch(string lineEnding)
     {
         var manifest = WriteChainedFixture();
-        File.WriteAllText(manifest, File.ReadAllText(manifest).Replace(
+        var source = File.ReadAllText(manifest).ReplaceLineEndings(lineEnding);
+        var normalized = source.ReplaceLineEndings("\n");
+        var invalid = normalized.Replace(
             "      scan:\n        from: \"$target\"",
-            "      scan:\n        needs: [judge]\n        from: \"$target\""));
+            "      scan:\n        needs: [judge]\n        from: \"$target\"");
+        Assert.NotEqual(normalized, invalid);
+        File.WriteAllText(manifest, invalid.ReplaceLineEndings(lineEnding));
         var calls = new List<string>();
 
         var error = Assert.Throws<AgentControlSpecNativeException>(() =>
