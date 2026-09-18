@@ -21,6 +21,31 @@ def test_valid_manifest_is_accepted():
     assert validate_manifest(VALID) is None
 
 
+def test_resource_limits_are_boundary_errors_and_text_limits_are_configurable():
+    from agent_control_spec import (
+        merge_manifests,
+        parse_manifest,
+        validate_manifest_detailed,
+    )
+
+    source = VALID + "\n# " + "x" * 1_048_576
+    for operation in [
+        validate_manifest,
+        parse_manifest,
+        validate_manifest_detailed,
+        lambda text, **kwargs: merge_manifests([text], **kwargs),
+    ]:
+        with pytest.raises(
+            ValueError, match="runtime_error:resource_limit_exceeded"
+        ) as error:
+            operation(source)
+        assert not isinstance(error.value, ManifestInvalidError)
+        operation(source, limits={"max_merged_manifest_bytes": 2_097_152})
+        with pytest.raises(ValueError, match="runtime_error:resource_limit_exceeded"):
+            operation(VALID, limits={"max_manifest_nodes": 1})
+        operation(VALID, limits={"max_policy_input_depth": 0})
+
+
 def test_unsupported_version_is_rejected_with_the_engine_message():
     source = VALID.replace('"0.4.0-alpha.1"', '"0.3.1-beta"')
     with pytest.raises(ManifestInvalidError) as excinfo:

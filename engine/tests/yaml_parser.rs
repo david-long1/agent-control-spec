@@ -15,6 +15,25 @@ intervention_points:
       id: p
 "#;
 
+struct ScratchDirectory(std::path::PathBuf);
+
+impl ScratchDirectory {
+    fn new(name: &str) -> Self {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join(format!("{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir_all(&path).unwrap();
+        Self(path)
+    }
+}
+
+impl Drop for ScratchDirectory {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 #[test]
 fn string_chain_file_and_json_entry_points_agree() {
     let expected = Manifest::from_yaml_str(MANIFEST).unwrap();
@@ -24,16 +43,16 @@ fn string_chain_file_and_json_entry_points_agree() {
     assert_eq!(Manifest::from_json_str(&serialized).unwrap(), expected);
     assert_eq!(Manifest::from_yaml_str(&serialized).unwrap(), expected);
 
-    let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("target")
-        .join(format!("yaml-parser-{}", std::process::id()));
-    std::fs::create_dir_all(&directory).unwrap();
-    let path = directory.join("manifest.yaml");
+    let directory = ScratchDirectory::new("yaml-parser");
+    let path = directory.0.join("manifest.yaml");
     std::fs::write(&path, MANIFEST).unwrap();
     assert_eq!(Manifest::from_path(&path).unwrap(), expected);
     let larger_source = format!("{MANIFEST}# {}\n", "x".repeat(1_048_576));
     std::fs::write(&path, larger_source).unwrap();
-    assert!(Manifest::from_path(&path).is_err());
+    assert!(matches!(
+        Manifest::from_path(&path),
+        Err(RuntimeError::ResourceLimitExceeded(_))
+    ));
     assert_eq!(
         Manifest::from_path_with_limits(
             &path,
@@ -48,7 +67,251 @@ fn string_chain_file_and_json_entry_points_agree() {
     std::fs::write(&path, format!("{MANIFEST}\n---\n{MANIFEST}")).unwrap();
     let error = Manifest::from_path(&path).unwrap_err();
     assert!(error.detail().contains("manifest.yaml"));
-    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn typed_strings_and_keys_require_string_scalars() {
+    for scalar in ["1", "1.0", "true", "null", ""] {
+        let source = MANIFEST.replace(
+            "policy_target: $snap.input",
+            &format!("policy_target: {scalar}"),
+        );
+        assert!(
+            matches!(
+                Manifest::parse_yaml_str(&source),
+                Err(RuntimeError::ManifestInvalid(_))
+            ),
+            "{scalar}"
+        );
+        let source = format!("{MANIFEST}metadata: {{{scalar}: value}}");
+        assert!(Manifest::parse_yaml_str(&source).is_err(), "{scalar}");
+    }
+    for scalar in ["1", "1.0", "true", "null"] {
+        let source = MANIFEST.replace(
+            "policy_target: $snap.input",
+            &format!("policy_target: \"{scalar}\""),
+        );
+        assert!(Manifest::parse_yaml_str(&source).is_ok(), "{scalar}");
+        let source = format!("{MANIFEST}metadata: {{\"{scalar}\": value}}");
+        assert!(Manifest::parse_yaml_str(&source).is_ok(), "{scalar}");
+    }
+    let source = MANIFEST.replace("policy_target: $snap.input", "policy_target: \"\"");
+    assert!(Manifest::parse_yaml_str(&source).is_ok());
+}
+
+#[test]
+fn structures_are_maps_and_errors_retain_paths_and_locations() {
+    for source in [
+        "- 0.4.0-alpha.1\n- {}\n- []\n- {p: {type: test}}\n- {input: {policy_target: $snap.input, policy: {id: p}}}\n".into(),
+        MANIFEST.replace("    policy:\n      id: p", "    policy: [p]"),
+        MANIFEST.replace("    policy_target: $snap.input\n    policy:\n      id: p", "    [\"$snap.input\", null, null, {}, {id: p}]"),
+        format!("{MANIFEST}extends: [[https://example.com/base.yaml]]"),
+        format!("{MANIFEST}approval: [deny]"),
+    ] {
+        let error = Manifest::parse_yaml_str(&source).unwrap_err();
+        assert_eq!(error.reason(), "runtime_error:manifest_invalid", "{source}");
+        assert!(Manifest::from_yaml_chain(&[&source]).is_err());
+    }
+    for (source, path) in [
+        (
+            MANIFEST.replace("id: p", "foo: p"),
+            "intervention_points.input.policy",
+        ),
+        (
+            MANIFEST.replace("  input:", "  state:"),
+            "intervention_points",
+        ),
+        (
+            MANIFEST.replace("    policy:\n      id: p", "    policy: p"),
+            "intervention_points.input.policy",
+        ),
+        (
+            format!("{MANIFEST}extends: [{{path: ./parent.yaml}}]"),
+            "extends",
+        ),
+    ] {
+        let error = Manifest::parse_yaml_str(&source).unwrap_err();
+        assert!(error.detail().contains(path), "{error}");
+        assert!(
+            error.detail().contains("line ") && error.detail().contains("column "),
+            "{error}"
+        );
+    }
+}
+
+#[test]
+fn tabs_bom_and_explicit_scalar_tags() {
+    for scalar in ["1", "abc", "-1"] {
+        let block = format!("{MANIFEST}metadata:\n  value:\t{scalar}\n");
+        let flow = format!("{MANIFEST}metadata: {{value:\t{scalar}}}");
+        assert_eq!(
+            Manifest::parse_yaml_str(&block).unwrap(),
+            Manifest::parse_yaml_str(&flow).unwrap()
+        );
+    }
+    assert!(Manifest::parse_yaml_str(&format!("{MANIFEST}metadata:\n\tvalue: 1")).is_err());
+    assert_eq!(
+        Manifest::parse_yaml_str(&format!("\u{feff}{MANIFEST}")).unwrap(),
+        Manifest::parse_yaml_str(MANIFEST).unwrap()
+    );
+    assert!(Manifest::parse_yaml_str(&format!("{MANIFEST}\u{feff}metadata: {{}}")).is_err());
+    for scalar in [
+        "! 7",
+        "! abc",
+        "! \"7\"",
+        "! true",
+        "! {}",
+        "! []",
+        "!<!> 7",
+        "! |-\n    7",
+    ] {
+        let error = Manifest::parse_yaml_str(&format!("{MANIFEST}metadata:\n  value: {scalar}"))
+            .unwrap_err();
+        assert_eq!(error.reason(), "runtime_error:manifest_invalid", "{scalar}");
+    }
+    for scalar in ["!!null \"\"", "!!null |-\n"] {
+        let parsed =
+            Manifest::parse_yaml_str(&format!("{MANIFEST}metadata:\n  value: {scalar}")).unwrap();
+        assert_eq!(parsed.metadata["value"], json!(null));
+    }
+    let parsed = Manifest::parse_yaml_str(&format!(
+        "{MANIFEST}approval: {{timeout_seconds: !!int \"1\"}}"
+    ))
+    .unwrap();
+    assert_eq!(parsed.approval.unwrap().timeout_seconds, Some(1));
+    let parsed =
+        Manifest::parse_yaml_str(&format!("{MANIFEST}approval: {{timeout_seconds: -0}}")).unwrap();
+    assert_eq!(parsed.approval.as_ref().unwrap().timeout_seconds, Some(0));
+    assert!(parsed.validate().is_err());
+    let source = MANIFEST.replace(
+        "policy_target: $snap.input",
+        "policy_target: $snap.input\n    policy_target_kind: !!null \"\"",
+    );
+    assert!(Manifest::from_yaml_str(&source)
+        .unwrap()
+        .intervention_points[&agent_control_spec::InterceptionPoint::Input]
+        .policy_target_kind
+        .is_none());
+}
+
+#[test]
+fn budgets_are_configurable_and_independent_from_policy_depth() {
+    let limits = Limits {
+        max_policy_input_depth: 0,
+        ..Limits::default()
+    };
+    assert!(Manifest::from_yaml_str_with_limits(MANIFEST, limits).is_ok());
+    let source = format!(
+        "{MANIFEST}metadata:\n  anchor: &a x\n  copies: [{}]\n",
+        vec!["*a"; 1000].join(",")
+    );
+    assert_eq!(
+        Manifest::parse_yaml_str(&source).unwrap().metadata["copies"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1000
+    );
+    let maximum_aliases = format!(
+        "{MANIFEST}metadata:\n  anchor: &a x\n  copies: [{}]\n",
+        vec!["*a"; Limits::default().max_manifest_aliases].join(",")
+    );
+    assert_eq!(
+        Manifest::parse_yaml_str(&maximum_aliases).unwrap().metadata["copies"]
+            .as_array()
+            .unwrap()
+            .len(),
+        Limits::default().max_manifest_aliases
+    );
+    for limits in [
+        Limits {
+            max_manifest_depth: 1,
+            ..Limits::default()
+        },
+        Limits {
+            max_manifest_nodes: 1,
+            ..Limits::default()
+        },
+        Limits {
+            max_manifest_events: 1,
+            ..Limits::default()
+        },
+        Limits {
+            max_manifest_aliases: 999,
+            ..Limits::default()
+        },
+        Limits {
+            max_manifest_anchors: 0,
+            ..Limits::default()
+        },
+        Limits {
+            max_manifest_anchor_events: 0,
+            ..Limits::default()
+        },
+    ] {
+        let error = Manifest::parse_yaml_str_with_limits(&source, limits).unwrap_err();
+        assert_eq!(
+            error.reason(),
+            "runtime_error:resource_limit_exceeded",
+            "{error}"
+        );
+    }
+    let source = format!("{MANIFEST}metadata: [{}]", vec!["x"; 100_001].join(","));
+    assert!(matches!(
+        Manifest::parse_yaml_str(&source),
+        Err(RuntimeError::ResourceLimitExceeded(_))
+    ));
+    assert!(Manifest::parse_yaml_str_with_limits(
+        &source,
+        Limits {
+            max_manifest_nodes: 110_000,
+            ..Limits::default()
+        }
+    )
+    .is_ok());
+    let source = format!("{MANIFEST}metadata: [{}]", vec!["x"; 300_001].join(","));
+    let error = Manifest::parse_yaml_str(&source).unwrap_err();
+    assert_eq!(error.reason(), "runtime_error:resource_limit_exceeded");
+    assert!(error.detail().contains("event limit"));
+}
+
+#[test]
+fn json_loader_source_is_bounded_even_when_padding_compacts_away() {
+    let directory = ScratchDirectory::new("json-parser-source");
+    let path = directory.0.join("manifest.json");
+    let json = serde_json::to_string(&Manifest::parse_yaml_str(MANIFEST).unwrap()).unwrap();
+    std::fs::write(&path, format!("{json}{}", " ".repeat(1_048_576))).unwrap();
+    assert!(matches!(
+        Manifest::from_path(&path),
+        Err(RuntimeError::ResourceLimitExceeded(_))
+    ));
+    assert!(Manifest::from_path_with_limits(
+        &path,
+        Limits {
+            max_merged_manifest_bytes: 2_097_152,
+            ..Limits::default()
+        }
+    )
+    .is_ok());
+}
+
+#[test]
+fn parser_errors_are_for_authors_not_parser_configuration_advice() {
+    for source in [
+        format!("{MANIFEST}metadata: {{key: one, key: two}}"),
+        format!("{MANIFEST}metadata: {{key: .inf}}"),
+        MANIFEST.replace("type: test", "type: null"),
+    ] {
+        let error = Manifest::parse_yaml_str(&source).unwrap_err();
+        for internal in [
+            "DuplicateKeyPolicy",
+            "Options",
+            "Option<String>",
+            "reject_non_finite",
+        ] {
+            assert!(!error.detail().contains(internal), "{error}");
+        }
+    }
 }
 
 #[test]

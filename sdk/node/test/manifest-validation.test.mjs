@@ -6,7 +6,8 @@ import fs from "node:fs";
 import path from "node:path";
 
 const require = (await import("node:module")).createRequire(import.meta.url);
-const { validateManifest, validateManifestFile, supportedManifestVersions, ManifestInvalidError } =
+const { validateManifest, validateManifestFile, supportedManifestVersions, ManifestInvalidError,
+  parseManifest, mergeManifests, validateManifestDetailed } =
   require("../dist/index.js");
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "..");
@@ -17,6 +18,24 @@ const valid = fs.readFileSync(
 
 test("a valid manifest is accepted", () => {
   assert.equal(validateManifest(valid), undefined);
+});
+
+test("text resource limits stay boundary errors and can be configured", () => {
+  const source = valid + "\n# " + "x".repeat(1_048_576);
+  for (const operation of [
+    validateManifest, parseManifest, validateManifestDetailed,
+    (text, limits) => mergeManifests([text], limits),
+  ]) {
+    assert.throws(() => operation(source), (error) => {
+      assert.ok(!(error instanceof ManifestInvalidError));
+      assert.match(error.message, /runtime_error:resource_limit_exceeded/);
+      return true;
+    });
+    operation(source, { max_merged_manifest_bytes: 2_097_152 });
+    assert.throws(() => operation(valid, { max_manifest_nodes: 1 }),
+      /runtime_error:resource_limit_exceeded/);
+    operation(valid, { max_policy_input_depth: 0 });
+  }
 });
 
 test("an unsupported version is rejected with the engine message", () => {

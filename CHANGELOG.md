@@ -2,19 +2,42 @@
 
 ## Unreleased
 
-- Parse YAML manifests with `serde-saphyr` 1.2.0. Text, chain and file/URL
-  loaders now reject duplicate keys, unsupported tags and non-finite values,
-  and bound source size, nesting and anchor expansion. YAML merge keys remain
-  ordinary keys. Legacy numeric strings and YAML 1.2 boolean spellings retain
-  their types. Numeric fields do not coerce strings, including legacy forms
-  such as `010` and `1_000`. Invalid `extends` diagnostics retain the field
-  context. The manifest and runtime error APIs are unchanged. Source snippets
-  are not included in parser diagnostics.
-  Building the engine now requires Rust 1.89. Include this change in the next
-  coordinated prerelease described in `RELEASING.md`, not a republication of
-  0.4.0-alpha.3. This removes the engine's direct `serde_yaml` dependency.
-  Regorus YAML support remains unchanged and may retain a different YAML
-  implementation when its features are enabled.
+- Replace archived `serde_yaml` and its transpiled libyaml dependency with
+  `serde-saphyr` (caret `1.2`, locked to `1.2.0`) and `granit-parser` `1.2.1`.
+  Building the engine requires Rust 1.89, now checked in CI. Regorus YAML
+  capabilities remain unchanged and may use a different YAML implementation.
+- YAML manifest parsing rejects duplicate keys, unsupported tags (including
+  non-specific `!`), non-finite numbers and positional sequences in place of
+  structs. YAML merge keys remain ordinary keys. Typed string fields and mapping
+  keys spelled like numbers, booleans or null must be quoted; an empty plain
+  value is null, not an empty string. Use `policy_target: ""` to leave an overlay
+  target unset. Legacy spellings such as `010`, `1_000`, `0X1F` and `tRuE` retain
+  their string types, including when used as keys. Numeric fields do not coerce
+  these strings or ordinary quoted strings.
+- Explicit core tags determine scalar types: `!!int "1"` is numeric and
+  `!!null ""` or an empty `!!null` block is null. An optional string set to an
+  explicitly tagged null is absent. Parsing unsigned `-0` yields zero (fields
+  requiring positive values still reject it at validation). A leading UTF-8 BOM
+  and tabs separating mapping colons from values are accepted; indentation tabs
+  and embedded BOMs remain invalid. Diagnostics retain field paths and
+  line/column locations without source snippets or parser-configuration advice.
+- Manifest source and expanded scalar bytes are bounded by
+  `Limits.max_merged_manifest_bytes` (1 MiB), also used for composed manifests.
+  Local YAML **and JSON** reads stop after this cap plus one byte. YAML budgets
+  default to depth 64 (formerly the old parser's fixed 128), 100,000 expanded
+  nodes including keys, 300,000 scanned/replayed events, 50,000 aliases and
+  anchors, and 10,000 retained anchor event copies. Each is configurable through
+  a dedicated `max_manifest_*` limit; manifest depth is independent of
+  `max_policy_input_depth`. Alias reuse is not limited by a ratio heuristic.
+  Exceeded budgets retain `runtime_error:resource_limit_exceeded`, not grammar
+  rejection, across Rust, Python, Node, FFI and .NET text validation.
+- Add Rust `parse_yaml_str_with_limits`, `from_yaml_str_with_limits` and
+  `from_yaml_chain_with_limits`; Python/Node manifest tooling accepts optional
+  limits, FFI has additive `_with_limits` text functions, and .NET
+  `AcsManifest.Validate` accepts a limits dictionary. Existing no-options calls
+  use defaults. Rust `Limits` gains six fields; exhaustive struct literals must
+  supply them or use `..Limits::default()`. See [manifest parsing](docs/manifest-parsing.md) for contracts and
+  dependency evidence.
 - A manifest chain that fetches any `extends` URL is now URL sourced, and a
   URL sourced manifest may not read host secrets. A fetched document could
   name a host environment variable through `api_key_env` or one of the

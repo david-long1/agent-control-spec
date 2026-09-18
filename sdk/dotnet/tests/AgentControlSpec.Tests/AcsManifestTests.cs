@@ -23,6 +23,18 @@ public sealed class AcsManifestTests
     }
 
     [Fact]
+    public void TextResourceLimitsAreBoundaryFailuresAndCanBeConfigured()
+    {
+        var source = Valid + "\n# " + new string('x', 1_048_576);
+        var error = Assert.Throws<AgentControlSpecNativeException>(() => AcsManifest.Validate(source));
+        Assert.Contains("runtime_error:resource_limit_exceeded", error.Message);
+        AcsManifest.Validate(source, new Dictionary<string, ulong> { ["max_merged_manifest_bytes"] = 2_097_152 });
+        Assert.Throws<AgentControlSpecNativeException>(() =>
+            AcsManifest.Validate(Valid, new Dictionary<string, ulong> { ["max_manifest_nodes"] = 1 }));
+        AcsManifest.Validate(Valid, new Dictionary<string, ulong> { ["max_policy_input_depth"] = 0 });
+    }
+
+    [Fact]
     public void UnsupportedVersionIsRejectedWithTheEngineMessage()
     {
         var source = Valid.Replace("\"0.4.0-alpha.1\"", "\"0.3.1-beta\"");

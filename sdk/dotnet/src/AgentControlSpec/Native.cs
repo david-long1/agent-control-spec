@@ -72,6 +72,10 @@ internal static partial class Native
     private static partial int acs_validate_manifest(
         ReadOnlySpan<byte> source, nuint sourceLen, out IntPtr errOut);
 
+    [LibraryImport(Lib, StringMarshalling = StringMarshalling.Utf8)]
+    private static partial int acs_validate_manifest_with_limits(
+        ReadOnlySpan<byte> source, nuint sourceLen, string? limitsJson, out IntPtr errOut);
+
     [LibraryImport(Lib)]
     private static partial IntPtr acs_supported_manifest_versions(out IntPtr errOut);
 
@@ -148,7 +152,7 @@ internal static partial class Native
         encoderShouldEmitUTF8Identifier: false,
         throwOnInvalidBytes: true);
 
-    internal static void ValidateManifest(string source)
+    internal static void ValidateManifest(string source, string? limitsJson = null)
     {
         byte[] bytes;
         try
@@ -160,7 +164,7 @@ internal static partial class Native
             throw new AgentControlSpecNativeException(
                 $"source is not encodable as UTF-8: {e.Message}");
         }
-        var code = acs_validate_manifest(bytes, (nuint)bytes.Length, out var err);
+        var code = acs_validate_manifest_with_limits(bytes, (nuint)bytes.Length, limitsJson, out var err);
         var message = err != IntPtr.Zero ? TakeString(err) : null;
 
         switch (code)

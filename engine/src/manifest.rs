@@ -32,7 +32,7 @@ pub struct Manifest {
     pub extends: Vec<ManifestExtends>,
     #[serde(default)]
     pub policies: BTreeMap<String, PolicyConfig>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_intervention_points")]
     pub intervention_points: BTreeMap<InterceptionPoint, InterventionPointConfig>,
     #[serde(default)]
     pub tools: BTreeMap<String, ToolConfig>,
@@ -175,11 +175,62 @@ pub struct ApprovalResolverConfig {
     pub additional_properties: BTreeMap<String, JsonValue>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(untagged)]
 pub enum ManifestExtends {
     Reference(String),
     Url(ManifestUrlExtends),
+}
+
+impl<'de> Deserialize<'de> for ManifestExtends {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct ExtendsVisitor;
+        impl<'de> serde::de::Visitor<'de> for ExtendsVisitor {
+            type Value = ManifestExtends;
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("an extends reference string or URL mapping")
+            }
+            fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Self::Value, E> {
+                Ok(ManifestExtends::Reference(value.to_string()))
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                map: A,
+            ) -> Result<Self::Value, A::Error> {
+                ManifestUrlExtends::deserialize(serde::de::value::MapAccessDeserializer::new(map))
+                    .map(ManifestExtends::Url)
+            }
+        }
+        deserializer.deserialize_any(ExtendsVisitor)
+    }
+}
+
+// String map keys let path-tracking deserializers retain the actual point name
+// rather than an opaque enum key ("?") when a nested binding is malformed.
+fn deserialize_intervention_points<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<BTreeMap<InterceptionPoint, InterventionPointConfig>, D::Error> {
+    struct PointsVisitor;
+    impl<'de> serde::de::Visitor<'de> for PointsVisitor {
+        type Value = BTreeMap<InterceptionPoint, InterventionPointConfig>;
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("a mapping of intervention points")
+        }
+        fn visit_map<A: serde::de::MapAccess<'de>>(
+            self,
+            mut map: A,
+        ) -> Result<Self::Value, A::Error> {
+            let mut points = BTreeMap::new();
+            while let Some(key) = map.next_key::<String>()? {
+                let point = InterceptionPoint::deserialize(
+                    serde::de::value::StringDeserializer::<A::Error>::new(key),
+                )?;
+                points.insert(point, map.next_value()?);
+            }
+            Ok(points)
+        }
+    }
+    deserializer.deserialize_map(PointsVisitor)
 }
 
 fn deserialize_extends<'de, D>(deserializer: D) -> Result<Vec<ManifestExtends>, D::Error>
@@ -607,6 +658,14 @@ impl Manifest {
     }
 
     pub fn from_yaml_chain(inputs: &[&str]) -> Result<Self, RuntimeError> {
+        Self::from_yaml_chain_with_limits(inputs, Limits::default())
+    }
+
+    /// Parse and compose text fragments with explicit manifest resource budgets.
+    pub fn from_yaml_chain_with_limits(
+        inputs: &[&str],
+        limits: Limits,
+    ) -> Result<Self, RuntimeError> {
         if inputs.is_empty() {
             return Err(RuntimeError::ManifestInvalid(
                 "manifest yaml chain must not be empty".to_string(),
@@ -615,15 +674,18 @@ impl Manifest {
 
         let mut manifests = Vec::with_capacity(inputs.len());
         for (index, input) in inputs.iter().enumerate() {
-            let manifest = Self::parse_yaml_str(input).map_err(|err| match err {
-                RuntimeError::ManifestInvalid(detail) => RuntimeError::ManifestInvalid(format!(
-                    "failed to parse manifest chain entry {index} as YAML: {detail}"
-                )),
-                other => other,
-            })?;
+            let manifest =
+                Self::parse_yaml_str_with_limits(input, limits).map_err(|err| match err {
+                    RuntimeError::ManifestInvalid(detail) => RuntimeError::ManifestInvalid(
+                        format!("failed to parse manifest chain entry {index} as YAML: {detail}"),
+                    ),
+                    other => other,
+                })?;
             manifests.push(manifest);
         }
-        Self::merge_chain(manifests)
+        let manifest = Self::merge_chain(manifests)?;
+        ManifestLoader::with_limits(limits).validate_merged_manifest_size(Some(&manifest))?;
+        Ok(manifest)
     }
 
     /// Deserialize without validating.
@@ -632,11 +694,16 @@ impl Manifest {
     /// `extends` has been merged, so a caller holding a single document
     /// needs to inspect `extends` before deciding whether validation can
     /// give a meaningful answer.
+    ///
+    /// Returns `ManifestInvalid` for grammar/type errors and
+    /// `ResourceLimitExceeded` when a manifest parsing budget is breached.
     pub fn parse_yaml_str(input: &str) -> Result<Self, RuntimeError> {
         Self::parse_yaml_str_with_limits(input, Limits::default())
     }
 
-    fn parse_yaml_str_with_limits(input: &str, limits: Limits) -> Result<Self, RuntimeError> {
+    /// Deserialize without validating, using the manifest fields of [`Limits`].
+    /// Policy input/output depth does not affect manifest parsing.
+    pub fn parse_yaml_str_with_limits(input: &str, limits: Limits) -> Result<Self, RuntimeError> {
         if input.len() > limits.max_merged_manifest_bytes {
             return Err(RuntimeError::ResourceLimitExceeded(
                 "manifest source exceeds the byte limit".to_string(),
@@ -646,28 +713,53 @@ impl Manifest {
         // Alias diagnostics can wrap the typed error. Use the structured budget report.
         let parser_limit = std::rc::Rc::new(std::cell::Cell::new(false));
         let reported_limit = std::rc::Rc::clone(&parser_limit);
-        let value: JsonValue = serde_saphyr::from_str_with_options(
+        let mut path = serde_path_to_error::Track::new();
+        serde_saphyr::with_deserializer_from_str_with_options(
             &normalized,
             serde_saphyr::options! {
                 strict_booleans: true,
                 no_schema: true,
                 reject_unsupported_tags: true,
+                reject_non_finite_typeless_float: true,
+                duplicate_keys: serde_saphyr::DuplicateKeyPolicy::Error,
                 merge_keys: serde_saphyr::MergeKeyPolicy::AsOrdinary,
                 with_snippet: false,
+                alias_limits: serde_saphyr::alias_limits! {
+                    max_total_replayed_events: limits.max_manifest_events,
+                    max_replay_stack_depth: limits.max_manifest_depth,
+                    max_alias_expansions_per_anchor: limits.max_manifest_aliases,
+                },
                 budget: serde_saphyr::budget! {
-                    max_depth: limits.max_policy_input_depth,
-                    max_nodes: 100_000,
-                    max_events: 300_000,
+                    max_depth: limits.max_manifest_depth,
+                    flow_nesting_limit: limits.max_manifest_depth.saturating_add(1),
+                    max_nodes: limits.max_manifest_nodes,
+                    max_events: limits.max_manifest_events,
+                    max_aliases: limits.max_manifest_aliases,
+                    max_anchors: limits.max_manifest_anchors,
+                    enforce_alias_anchor_ratio: false,
+                    max_documents: 1,
+                    simple_key_max_lookahead: 1024,
                     max_total_scalar_bytes: limits.max_merged_manifest_bytes,
                     max_recorded_anchor_bytes: limits.max_merged_manifest_bytes,
-                    max_recorded_anchor_events: 100_000,
+                    max_recorded_anchor_events: limits.max_manifest_anchor_events,
                 },
             }
             .with_budget_report(move |report| {
                 reported_limit.set(report.breached.is_some());
             }),
+            |de| {
+                Self::deserialize(serde_path_to_error::Deserializer::new(
+                    crate::manifest_deserializer::Strict(de),
+                    &mut path,
+                ))
+            },
         )
         .map_err(|err| {
+            let detail = format!(
+                "{}: {}",
+                path.path(),
+                err.render_with_formatter(&serde_saphyr::UserMessageFormatter)
+            );
             if parser_limit.get()
                 || matches!(
                     err,
@@ -677,17 +769,20 @@ impl Manifest {
                         | serde_saphyr::Error::AliasReplayStackDepthExceeded { .. }
                 )
             {
-                RuntimeError::ResourceLimitExceeded(err.to_string())
+                RuntimeError::ResourceLimitExceeded(detail)
             } else {
-                RuntimeError::ManifestInvalid(err.to_string())
+                RuntimeError::ManifestInvalid(detail)
             }
-        })?;
-        serde_json::from_value(value)
-            .map_err(|error| RuntimeError::ManifestInvalid(error.to_string()))
+        })
     }
 
     pub fn from_yaml_str(input: &str) -> Result<Self, RuntimeError> {
-        let manifest = Self::parse_yaml_str(input)?;
+        Self::from_yaml_str_with_limits(input, Limits::default())
+    }
+
+    /// Deserialize and validate with explicit manifest resource budgets.
+    pub fn from_yaml_str_with_limits(input: &str, limits: Limits) -> Result<Self, RuntimeError> {
+        let manifest = Self::parse_yaml_str_with_limits(input, limits)?;
         manifest.validate()?;
         Ok(manifest)
     }
@@ -1371,7 +1466,7 @@ impl ManifestLoader {
                 included_manifest,
                 &ManifestSource::Location(included_source),
             )?;
-            self.validate_merged_manifest_size(&resolved)?;
+            self.validate_merged_manifest_size(resolved.as_ref())?;
         }
         self.stack.pop();
 
@@ -1381,7 +1476,7 @@ impl ManifestLoader {
             manifest,
             &ManifestSource::Location(location.clone()),
         )?;
-        self.validate_merged_manifest_size(&resolved)?;
+        self.validate_merged_manifest_size(resolved.as_ref())?;
         Ok(resolved.expect("current manifest should always be merged"))
     }
 
@@ -1391,12 +1486,27 @@ impl ManifestLoader {
         _including: &ManifestLocation,
     ) -> Result<Vec<u8>, RuntimeError> {
         match location {
-            ManifestLocation::Path(path) => fs::read(path).map_err(|err| {
-                RuntimeError::ManifestUnreadable(format!(
-                    "failed to read manifest file '{}': {err}",
-                    path.display()
-                ))
-            }),
+            ManifestLocation::Path(path) => {
+                let mut body = Vec::new();
+                fs::File::open(path)
+                    .and_then(|file| {
+                        file.take(self.limits.max_merged_manifest_bytes.saturating_add(1) as u64)
+                            .read_to_end(&mut body)
+                    })
+                    .map_err(|err| {
+                        RuntimeError::ManifestUnreadable(format!(
+                            "failed to read manifest file '{}': {err}",
+                            path.display()
+                        ))
+                    })?;
+                if body.len() > self.limits.max_merged_manifest_bytes {
+                    return Err(RuntimeError::ResourceLimitExceeded(format!(
+                        "manifest source '{}' exceeds the byte limit",
+                        path.display()
+                    )));
+                }
+                Ok(body)
+            }
             ManifestLocation::Url(url) => self.fetch_url_body(url),
         }
     }
@@ -1419,7 +1529,7 @@ impl ManifestLoader {
 
     fn validate_merged_manifest_size(
         &self,
-        resolved: &Option<Manifest>,
+        resolved: Option<&Manifest>,
     ) -> Result<(), RuntimeError> {
         let Some(manifest) = resolved else {
             return Ok(());
@@ -1484,14 +1594,15 @@ fn preserve_scalar_types(
         input,
         granit_parser::options! {
             emit_comments: false,
-            flow_nesting_limit: limits.max_policy_input_depth,
-            block_nesting_limit: limits.max_policy_input_depth,
+            flow_nesting_limit: limits.max_manifest_depth.saturating_add(1),
+            block_nesting_limit: limits.max_manifest_depth.saturating_add(1),
         },
     );
     let mut output = String::new();
     let mut copied = 0;
+    let mut documents = 0;
     for (events, event) in parser.enumerate() {
-        if events >= 300_000 {
+        if events >= limits.max_manifest_events {
             return Err(RuntimeError::ResourceLimitExceeded(
                 "manifest parser event limit exceeded".to_string(),
             ));
@@ -1503,6 +1614,30 @@ fn preserve_scalar_types(
                 RuntimeError::ManifestInvalid(error.to_string())
             }
         })?;
+        if matches!(event, Event::DocumentStart(..)) {
+            documents += 1;
+            if documents > 1 {
+                return Err(RuntimeError::ManifestInvalid(
+                    "expected exactly one YAML document".to_string(),
+                ));
+            }
+        }
+        let tag = match &event {
+            Event::Scalar(_, _, _, tag)
+            | Event::MappingStart(_, _, tag)
+            | Event::SequenceStart(_, _, tag) => tag,
+            _ => &None,
+        };
+        if tag
+            .as_ref()
+            .is_some_and(|tag| tag.handle().is_empty() && tag.suffix() == "!")
+        {
+            return Err(RuntimeError::ManifestInvalid(format!(
+                "non-specific YAML tags are not supported at line {}, column {}",
+                span.start.line(),
+                span.start.col() + 1
+            )));
+        }
         let Event::Scalar(value, style, _, tag) = event else {
             continue;
         };
@@ -1510,10 +1645,7 @@ fn preserve_scalar_types(
             .as_ref()
             .is_some_and(|tag| tag.is_yaml_core_schema_tag("bool"));
         let kind = tag.as_ref().and_then(|tag| tag.core_suffix());
-        let string_tag = kind == Some("str")
-            || tag
-                .as_ref()
-                .is_some_and(|tag| tag.handle() == "!" && tag.suffix().is_empty());
+        let string_tag = kind == Some("str");
         let integer_tag = kind == Some("int");
         let float_tag = kind == Some("float");
         let null_tag = kind == Some("null");
@@ -1728,6 +1860,11 @@ fn parse_manifest_source(
     location: &ManifestLocation,
     limits: Limits,
 ) -> Result<Manifest, RuntimeError> {
+    if source.len() > limits.max_merged_manifest_bytes {
+        return Err(RuntimeError::ResourceLimitExceeded(
+            "manifest source exceeds the byte limit".to_string(),
+        ));
+    }
     let parse_as_json = location.is_json();
     if parse_as_json {
         serde_json::from_str(source).map_err(|err| {
