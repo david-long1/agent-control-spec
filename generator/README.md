@@ -10,8 +10,6 @@ This is a port of AGT's `acs-generate --prompt` flow from
 The guided `acs-generate init` designer is not included. The distribution
 `agent-control-spec-generator` and command `acs-policy-gen` have different names
 so they can coexist with AGT's generator.
-`generator/LICENSE` retains AGT's Microsoft copyright notice alongside this
-repository's notice so the separately packaged port carries its attribution.
 
 ### Behavior changes from AGT
 
