@@ -10,7 +10,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
-from .conditions import require_regorus_ast
+from .conditions import inspect_conditions, require_regorus_ast
 from .llm import LanguageModel
 from .manifest_builder import build_manifest, referenced_tool_names, validate_inventory
 from .output import output_lock, write_artifacts
@@ -57,6 +57,8 @@ iteration, not comprehensions or every blocks. Regex patterns must be literal st
 or variables assigned literal strings; no computed patterns or regex templates.
 Do not use external data, network calls, clocks, randomness, print, or with overrides.
 Do not introduce helper rules. Conditions are parsed before any evaluation.
+Condition strings may contain LF newlines, but no literal control, format, or
+Unicode line-separator characters. Use escaped Rego string literals when needed.
 
 input.policy_target.value is the agent-hooks target at that point:
 {json.dumps(TARGET_SHAPES, indent=2)}
@@ -185,6 +187,20 @@ class GenerationEngine:
                 )
                 continue
             warnings = [*plan.warnings, *validation.warnings]
+            warnings.extend(
+                warning
+                for rule in plan.rules
+                for warning in inspect_conditions(rule.conditions, rule.point).warnings
+            )
+            warnings.extend(
+                f"Annotator {binding.annotator} at {binding.point} reads outside $target "
+                f"from {binding.from_path}; review what data the host dispatcher receives"
+                for binding in plan.annotations
+                if not (
+                    binding.from_path == "$target"
+                    or binding.from_path.startswith(("$target.", "$target["))
+                )
+            )
             missing = set(referenced_tool_names(plan)) - inventory.keys()
             if missing:
                 warnings.append(

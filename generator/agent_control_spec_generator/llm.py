@@ -4,14 +4,19 @@
 
 from __future__ import annotations
 
+import http.client
+import io
 import json
 import os
+import time
+from functools import partial
 from typing import Protocol
 from urllib import error, parse, request
 
 DEFAULT_API_BASE = "https://api.openai.com/v1"
 DEFAULT_MODEL = "gpt-4o-mini"
 REQUEST_TIMEOUT_SECONDS = 60
+REQUEST_DEADLINE_SECONDS = 120
 MAX_RESPONSE_BYTES = 1_000_000
 
 
@@ -21,6 +26,80 @@ class LanguageModel(Protocol):
 
 class ProviderError(RuntimeError):
     """A provider/configuration failure, never retried as a bad policy plan."""
+
+
+class _DeadlineExceeded(TimeoutError):
+    pass
+
+
+def _remaining(deadline: float) -> float:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise _DeadlineExceeded
+    return min(REQUEST_TIMEOUT_SECONDS, remaining)
+
+
+class _DeadlineReader(io.RawIOBase):
+    """Apply the remaining budget to every receive, including status/headers."""
+
+    def __init__(self, sock, deadline: float):
+        self._socket = sock
+        self._raw = sock.makefile("rb", buffering=0)
+        self._deadline = deadline
+
+    def readable(self):
+        return True
+
+    def readinto(self, buffer):
+        self._socket.settimeout(_remaining(self._deadline))
+        try:
+            size = self._raw.readinto(buffer)
+        except TimeoutError:
+            _remaining(self._deadline)
+            raise
+        _remaining(self._deadline)
+        return size
+
+    def close(self):
+        self._raw.close()
+        super().close()
+
+
+class _DeadlineResponse(http.client.HTTPResponse):
+    def __init__(self, sock, *args, deadline: float, **kwargs):
+        super().__init__(sock, *args, **kwargs)
+        self.fp.close()
+        self.fp = io.BufferedReader(_DeadlineReader(sock, deadline))
+
+
+def _connection(kind, deadline, host, **kwargs):
+    connection = kind(host, **kwargs)
+    connection.response_class = partial(_DeadlineResponse, deadline=deadline)
+    return connection
+
+
+class _DeadlineHTTPHandler(request.HTTPHandler):
+    def __init__(self, deadline):
+        super().__init__()
+        self.deadline = deadline
+
+    def http_open(self, req):
+        return self.do_open(
+            partial(_connection, http.client.HTTPConnection, self.deadline), req
+        )
+
+
+class _DeadlineHTTPSHandler(request.HTTPSHandler):
+    def __init__(self, deadline):
+        super().__init__()
+        self.deadline = deadline
+
+    def https_open(self, req):
+        return self.do_open(
+            partial(_connection, http.client.HTTPSConnection, self.deadline),
+            req,
+            context=self._context,
+        )
 
 
 class _NoRedirects(request.HTTPRedirectHandler):
@@ -48,6 +127,7 @@ class OpenAICompatibleLanguageModel:
         model: str | None = None,
         api_version: str | None = None,
     ) -> None:
+        # This is the only reader of ACS_GENERATOR_* environment variables.
         self.api_base = (
             api_base or os.getenv("ACS_GENERATOR_API_BASE") or DEFAULT_API_BASE
         ).rstrip("/")
@@ -55,7 +135,7 @@ class OpenAICompatibleLanguageModel:
             api_key if api_key is not None else os.getenv("ACS_GENERATOR_API_KEY")
         )
         self.model = model or os.getenv("ACS_GENERATOR_MODEL") or DEFAULT_MODEL
-        self.api_version = api_version or os.getenv("ACS_GENERATOR_API_VERSION")
+        self.api_version = api_version or os.getenv("ACS_GENERATOR_API_VERSION") or None
         try:
             parsed = parse.urlsplit(self.api_base)
             valid = (
@@ -78,6 +158,7 @@ class OpenAICompatibleLanguageModel:
             raise ProviderError(
                 "API base must be HTTPS without credentials, query or fragment (HTTP is allowed only for loopback tests)"
             )
+        self._scheme = parsed.scheme
         self.is_azure = self.api_version is not None or _is_azure_api_base(
             self.api_base
         )
@@ -124,11 +205,32 @@ class OpenAICompatibleLanguageModel:
         req = request.Request(
             url, json.dumps(payload).encode("utf-8"), headers, method="POST"
         )
+        deadline = time.monotonic() + REQUEST_DEADLINE_SECONDS
+        handlers = [
+            _NoRedirects(),
+            _DeadlineHTTPHandler(deadline),
+            _DeadlineHTTPSHandler(deadline),
+        ]
+        if self._scheme == "http":
+            # HTTP is allowed only for loopback tests. Never send its bearer
+            # token to a proxy selected by the host environment.
+            handlers.append(request.ProxyHandler({}))
         try:
-            with request.build_opener(_NoRedirects()).open(
-                req, timeout=REQUEST_TIMEOUT_SECONDS
+            with request.build_opener(*handlers).open(
+                req, timeout=_remaining(deadline)
             ) as response:
-                encoded = response.read(MAX_RESPONSE_BYTES + 1)
+                encoded = bytearray()
+                while len(encoded) <= MAX_RESPONSE_BYTES:
+                    _remaining(deadline)
+                    chunk = response.read1(
+                        min(65536, MAX_RESPONSE_BYTES + 1 - len(encoded))
+                    )
+                    _remaining(deadline)
+                    if not chunk:
+                        break
+                    encoded.extend(chunk)
+        except _DeadlineExceeded:
+            raise ProviderError("LLM request exceeded the response deadline") from None
         except error.HTTPError as exc:
             status = exc.code
             exc.close()
@@ -136,7 +238,7 @@ class OpenAICompatibleLanguageModel:
                 f"LLM request failed with HTTP {status}; check endpoint, deployment, "
                 "credentials and provider diagnostics (response body omitted)"
             ) from None
-        except (OSError, ValueError):
+        except (OSError, ValueError, http.client.HTTPException):
             raise ProviderError(
                 "LLM transport failed; check connectivity and endpoint configuration"
             ) from None

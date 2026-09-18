@@ -7,8 +7,10 @@ import os
 import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 
 import pytest
+import tomllib
 from agent_control_spec import _native
 from agent_control_spec.authoring import REGORUS_AST_VERSION, parse_rego_ast
 
@@ -16,11 +18,29 @@ from agent_control_spec.authoring import REGORUS_AST_VERSION, parse_rego_ast
 def test_regorus_ast_version_and_source_are_explicit():
     source = 'package test\nimport rego.v1\nrule if { input["text"] == "café" }\n'
     policies = parse_rego_ast(source)
-    assert REGORUS_AST_VERSION == "0.12.0"
+    assert REGORUS_AST_VERSION == resolved_regorus_version()
     assert policies[0]["version"] == 1
     assert policies[0]["source"]["contents"] == source
     assert policies[0]["ast"]["package"]["refr"]["Var"]["value"] == "test"
     assert policies[0]["ast"]["rego_v1"]
+
+
+def resolved_regorus_version():
+    sdk = Path(__file__).resolve().parents[1]
+    lock = tomllib.loads((sdk / "Cargo.lock").read_text(encoding="utf-8"))
+    versions = [
+        package["version"]
+        for package in lock["package"]
+        if package["name"] == "regorus"
+    ]
+    assert len(versions) == 1, "authoring and runtime must resolve the same Regorus"
+    cargo = tomllib.loads((sdk / "Cargo.toml").read_text(encoding="utf-8"))
+    assert cargo["dependencies"]["regorus"]["version"] == "=" + versions[0]
+    return versions[0]
+
+
+def test_compiled_ast_version_matches_the_resolved_crate():
+    assert _native.REGORUS_AST_VERSION == resolved_regorus_version()
 
 
 def test_parsing_does_not_compile_or_evaluate_builtins():

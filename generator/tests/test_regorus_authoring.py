@@ -7,7 +7,7 @@ import subprocess
 import sys
 
 import pytest
-from agent_control_spec import _native
+from agent_control_spec import authoring
 from agent_control_spec_generator import (
     GenerationEngine,
     GenerationError,
@@ -37,7 +37,7 @@ def test_generation_requires_neither_opa_nor_a_subprocess(monkeypatch):
 
 
 def test_old_sdk_fails_before_any_model_call(monkeypatch):
-    monkeypatch.delattr(_native, "parse_rego_ast")
+    monkeypatch.delattr(authoring, "parse_rego_ast")
     model = StubLanguageModel([minimal_plan()])
     with pytest.raises(RuntimeError, match="same checkout"):
         GenerationEngine(model).generate(prompt="synthetic", write=False)
@@ -45,7 +45,7 @@ def test_old_sdk_fails_before_any_model_call(monkeypatch):
 
 
 def test_unknown_ast_version_fails_before_any_model_call(monkeypatch):
-    monkeypatch.setattr(_native, "REGORUS_AST_VERSION", "future-version")
+    monkeypatch.setattr(authoring, "REGORUS_AST_VERSION", "future-version")
     model = StubLanguageModel([minimal_plan()])
     with pytest.raises(RuntimeError, match="Regorus 0.12.0"):
         GenerationEngine(model).generate(prompt="synthetic", write=False)

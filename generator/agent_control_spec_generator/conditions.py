@@ -9,24 +9,39 @@ from dataclasses import dataclass
 from functools import lru_cache
 from typing import Any
 
+from .text import is_control
+
 
 class ConditionError(ValueError):
     """A condition cannot be checked within the supported authoring subset."""
 
 
-def require_regorus_ast() -> Callable[[str], list[dict[str, Any]]]:
-    from agent_control_spec import _native
+def condition_source(conditions: tuple[str, ...]) -> str:
+    """The exact bytes both inspection and rendering use, separated only by LF."""
+    source = "\n".join(conditions)
+    for char in source:
+        if char != "\n" and is_control(char):
+            raise ConditionError(
+                f"condition contains forbidden character U+{ord(char):04X}"
+            )
+    return source
 
-    if getattr(_native, "REGORUS_AST_VERSION", None) != "0.12.0" or not callable(
-        getattr(_native, "parse_rego_ast", None)
-    ):
+
+def require_regorus_ast() -> Callable[[str], list[dict[str, Any]]]:
+    try:
+        from agent_control_spec.authoring import REGORUS_AST_VERSION, parse_rego_ast
+    except (ImportError, AttributeError):
+        raise RuntimeError(
+            "this generator requires the authoring-enabled ACS SDK; install SDK and "
+            "generator from the same checkout"
+        ) from None
+
+    if REGORUS_AST_VERSION != "0.12.0" or not callable(parse_rego_ast):
         raise RuntimeError(
             "this generator requires ACS's Regorus 0.12.0 authoring support; "
             "install the SDK and generator from the same checkout with "
             "'python -m pip install ./sdk/python ./generator'"
         )
-    from agent_control_spec.authoring import parse_rego_ast
-
     return parse_rego_ast
 
 
@@ -118,7 +133,7 @@ def _statement(stmt: dict[str, Any]) -> dict[str, Any]:
     if kind in {"Expr", "NotExpr"}:
         return {"terms": _expression(value["expr"]), "negated": kind == "NotExpr"}
     if kind == "SomeIn":
-        return {"terms": _membership(value)}
+        return {"terms": _membership(value), "iteration": True}
     if kind == "SomeVars":
         return {"terms": {"symbols": []}}
     if kind == "Every":
@@ -235,6 +250,7 @@ class ConditionInfo:
     annotators: frozenset[str]
     tools: frozenset[str]
     uses_tool: bool
+    warnings: tuple[str, ...] = ()
 
 
 # Keep authoring evaluation free of network, host/environment introspection,
@@ -326,7 +342,7 @@ _OBJECT_MEMBERS = {
 def inspect_conditions(conditions: tuple[str, ...], point: str) -> ConditionInfo:
     if not conditions:
         return ConditionInfo((), frozenset(), frozenset(), False)
-    tree = _parse("\n".join(conditions))
+    tree = _parse(condition_source(conditions))
     nodes = list(_walk(tree))
     # Literal/alias inference below is single-scope. Flattening bindings from
     # comprehensions or every blocks would let a local literal certify an
@@ -489,9 +505,22 @@ def inspect_conditions(conditions: tuple[str, ...], point: str) -> ConditionInfo
         raise ConditionError(
             "a constant body selects every request or none; conditions must read input"
         )
+    iterations: dict[tuple[Any, ...], int] = {}
+    for statement in tree["body"]:
+        if statement.get("iteration"):
+            collection = resolved(statement["terms"]["value"][-1])
+            if collection and collection[0] == "input":
+                iterations[collection] = iterations.get(collection, 0) + 1
+    warnings = tuple(
+        f"{count} iterations over {'.'.join(str(part) for part in collection)} at "
+        f"{point} can form a Cartesian product; test realistic input sizes"
+        for collection, count in iterations.items()
+        if count > 1
+    )
     return ConditionInfo(
         tuple(dict.fromkeys(patterns)),
         frozenset(annotators),
         frozenset(tools),
         uses_tool,
+        warnings,
     )

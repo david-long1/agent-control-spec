@@ -7,6 +7,7 @@ from __future__ import annotations
 from typing import Any
 
 from .plan import PolicyPlan
+from .text import code_block, inline_code
 
 
 def build_report(
@@ -53,28 +54,40 @@ def build_report(
     for point, config in manifest["intervention_points"].items():
         lines.append(f"- `{point}` reads `{config['policy_target']}`.")
         for name, binding in config.get("annotations", {}).items():
-            lines.append(f"  - Host annotator `{name}` reads `{binding['from']}`.")
+            lines.append(
+                f"  - Host annotator {inline_code(name)} reads {inline_code(binding['from'])}."
+            )
     lines.extend(["", "## Rules", ""])
     for rule in plan.rules:
-        lines.append(f"### {rule.point}: {rule.reason}")
-        lines.extend(["", f"Policy intent: `{rule.decision}`.", "", "```rego"])
-        lines.extend(rule.conditions or ("true",))
-        lines.extend(["```", ""])
+        lines.append(f"### {rule.point}: {inline_code(rule.reason)}")
+        lines.extend(
+            [
+                "",
+                f"Policy intent: `{rule.decision}`.",
+                "",
+                code_block("\n".join(rule.conditions or ("true",))),
+                "",
+            ]
+        )
     lines.extend(["## Host configuration", ""])
     labels = {item.name: item.labels for item in plan.annotators}
     for name, config in manifest.get("annotators", {}).items():
         expected = ", ".join(labels.get(name, ())) or "not specified"
-        lines.append(f"- `{name}` ({config['type']}), expected labels: {expected}.")
+        lines.append(
+            f"- {inline_code(name)} ({config['type']}), expected labels: {inline_code(expected)}."
+        )
     if not manifest.get("annotators"):
         lines.append("- No annotator bindings.")
     tools = manifest.get("tools", {})
     lines.append(
-        "- Tool catalog: " + (", ".join(f"`{name}`" for name in tools) or "none") + "."
+        "- Tool catalog: "
+        + (", ".join(inline_code(name) for name in tools) or "none")
+        + "."
     )
     lines.append(
         "An unknown tool is denied when tool projection is enabled. Supply the complete inventory."
     )
     if warnings:
         lines.extend(["", "## Warnings", ""])
-        lines.extend(f"- {warning}" for warning in dict.fromkeys(warnings))
+        lines.extend(f"- {inline_code(warning)}" for warning in dict.fromkeys(warnings))
     return "\n".join(lines) + "\n"

@@ -10,11 +10,30 @@ This is a port of AGT's `acs-generate --prompt` flow from
 The guided `acs-generate init` designer is not included. The distribution
 `agent-control-spec-generator` and command `acs-policy-gen` have different names
 so they can coexist with AGT's generator.
+`generator/LICENSE` retains AGT's Microsoft copyright notice alongside this
+repository's notice so the separately packaged port carries its attribution.
+
+### Behavior changes from AGT
+
+- Manifests read the agent-hooks `$.target` shape. Saved plans using old model
+  request/response paths or assuming a scalar input/output target need updating.
+- Effects on non-transform decisions, empty annotation `from` paths, undeclared
+  explicit annotator bindings, and unsupported conditions are rejected. AGT
+  dropped some effects, defaulted empty paths, and accepted a wider set of builtins.
+  In particular, this authoring subset rejects `time.now_ns`, `glob.match`, and
+  `regex.template_match`.
+- Sampling uses the provider default rather than requesting `temperature: 0`.
+- Empty verdict messages and `extends: []` are omitted. Names beginning with a
+  digit get a `policy_` prefix, so `2fa Agent` becomes `policy_2fa_agent`.
+- The raw `--api-key` flag is removed. Use the environment or `--api-key-file`.
+- Existing output directories require explicit replacement; old artifacts are
+  retained in a backup rather than overwritten in place.
 
 ## Install from this checkout
 
-The generator is a separate Python package. It is not part of the ACS runtime
-wheel, and this change does not publish it to PyPI.
+The generator is a separate Python package with version metadata kept in lockstep
+with ACS. It is not part of the runtime wheel or the tag-driven publication set.
+See [RELEASING.md](../RELEASING.md). This change does not publish it to PyPI.
 
 From the repository root, in a virtual environment:
 
@@ -23,10 +42,10 @@ python -m pip install ./sdk/python ./generator
 ```
 
 Building `sdk/python` requires Rust and the package's maturin build backend.
-Install both packages from this checkout. The published `agent-control-spec`
-0.4.0a3 wheel predates the new authoring helper, despite sharing the checkout's
-current version number. An older or incompatible native binding produces an
-installation error before any model call.
+The dependency floor is SDK `0.4.0a4`, the first version with the authoring helper.
+Until that SDK release is available, install both packages from this checkout.
+If dependency resolution is bypassed or an editable native build is stale, the
+generator reports the incompatible binding on first use, before any model call.
 
 Neither generation nor runtime evaluation requires an OPA executable. The
 Python SDK exposes Regorus's in-process parser through
@@ -82,13 +101,16 @@ memory. A custom model only needs `complete(system, user) -> str`.
 | Flag | Environment variable | Default |
 | --- | --- | --- |
 | `--api-base` | `ACS_GENERATOR_API_BASE` | `https://api.openai.com/v1` |
-| `--api-key` | `ACS_GENERATOR_API_KEY` | Required |
+| `--api-key-file` | `ACS_GENERATOR_API_KEY` when no file is supplied | Required |
 | `--model` | `ACS_GENERATOR_MODEL` | `gpt-4o-mini` |
 | `--api-version` | `ACS_GENERATOR_API_VERSION` | Unset |
 | `--max-attempts` | None | 5, with an allowed range of 1 through 5 |
 
-Prefer the environment variable over `--api-key` to keep credentials out of
-shell history. The provider receives the authoring instructions, supplied prose,
+The CLI never accepts a raw key value in argv. Set `ACS_GENERATOR_API_KEY`, or
+pass a UTF-8 key file to `--api-key-file`; `-` reads the key from stdin.
+The prompt and key cannot both read stdin. The provider constructor is the
+single reader of the four `ACS_GENERATOR_*` variables.
+The provider receives the authoring instructions, supplied prose,
 tool inventory, and any rejected plan and repair diagnostic. Do not supply
 secrets or customer data unless that endpoint is approved to receive them.
 
@@ -99,10 +121,14 @@ resource root uses `/openai/v1`; a caller-supplied v1 base is used as written.
 Azure requests use `api-key`; other v1 requests use bearer authorization.
 
 Requests require HTTPS, except for loopback test servers. Redirects are refused.
-Each request has a 60-second transport timeout, a 4,096-completion-token budget,
-and a 1 MB response limit. The timeout is a socket-operation timeout, not a total
-generation deadline. Sampling is left to the provider; generation is not
-deterministic.
+Each request has a 60-second socket timeout, a 120-second response deadline,
+a 4,096-completion-token budget, and a 1 MB response limit. A monotonic budget
+limits every response receive, including status/header parsing, so a trickling
+server cannot keep resetting the timeout. Platform DNS resolution still follows
+the host resolver's limits; this is not a deadline for the whole generation.
+HTTPS uses the standard proxy environment variables. Loopback HTTP bypasses all
+proxies to keep its credential on the local connection.
+Sampling is left to the provider; generation is not deterministic.
 
 A rejected plan gets another attempt with the previous response and diagnostic.
 Provider failures, refusals, truncated responses, missing credentials, and write
@@ -126,6 +152,9 @@ Annotator references produce manifest bindings, including references through
 simple aliases and quoted keys. Undeclared references receive a classifier
 declaration and a warning. The host must provide and configure that dispatcher;
 generation does not implement a classifier or call an annotator service.
+Explicit bindings may use other roots accepted by ACS, such as `$snap` or `$pi`.
+The report warns about every explicit binding outside `$target`; review the data
+it exposes before configuring a real dispatcher.
 
 ## Supported plans and review limits
 
@@ -159,6 +188,8 @@ checks collected patterns with the runtime regex engine and evaluates synthetic
 contexts at every bound point. These smoke cases use empty annotation results
 and do not prove that a rule ever matches. Application-specific properties,
 regex coverage, policy completeness, and host enforcement still need tests.
+Repeated top-level iterations over the same input collection produce a warning
+because they may form a Cartesian product. The warning is not a performance bound.
 
 The default verdict is allow. Rules use a first-match chain ordered
 `deny > escalate > transform > warn > allow`, with plan order breaking ties.

@@ -6,7 +6,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import sys
 from pathlib import Path
 from typing import Any
@@ -17,19 +16,25 @@ from .engine import GenerationEngine, GenerationError
 from .llm import DEFAULT_API_BASE, DEFAULT_MODEL, OpenAICompatibleLanguageModel
 from .manifest_builder import validate_inventory
 from .output import check_output
+from .text import terminal_text
 from .vocabulary import MAX_REPAIR_ATTEMPTS
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = _parser()
-    args = parser.parse_args(list(sys.argv[1:] if argv is None else argv))
+    arguments = list(sys.argv[1:] if argv is None else argv)
+    if any(arg == "--api-key" or arg.startswith("--api-key=") for arg in arguments):
+        parser.error(
+            "--api-key was removed; use --api-key-file or ACS_GENERATOR_API_KEY"
+        )
+    args = parser.parse_args(arguments)
     try:
         out_dir = Path(args.out)
         if not args.dry_run:
             check_output(out_dir, force=args.force)
         model = OpenAICompatibleLanguageModel(
             api_base=args.api_base,
-            api_key=args.api_key,
+            api_key=_api_key(args),
             model=args.model,
             api_version=args.api_version,
         )
@@ -41,15 +46,23 @@ def main(argv: list[str] | None = None) -> int:
             force=args.force,
         )
     except (OSError, ValueError, GenerationError, RuntimeError, yaml.YAMLError) as exc:
-        print(f"acs-policy-gen failed: {exc}", file=sys.stderr)
+        print(terminal_text(f"acs-policy-gen failed: {exc}"), file=sys.stderr)
         return 1
     if args.dry_run:
-        print(f"--- manifest.yaml ---\n{result.manifest_yaml}")
-        print(f"--- policy/{result.slug}.rego ---\n{result.rego}")
-        print(f"--- report.md ---\n{result.report}")
+        print(
+            terminal_text(
+                f"--- manifest.yaml ---\n{result.manifest_yaml}", multiline=True
+            )
+        )
+        print(
+            terminal_text(
+                f"--- policy/{result.slug}.rego ---\n{result.rego}", multiline=True
+            )
+        )
+        print(terminal_text(f"--- report.md ---\n{result.report}", multiline=True))
     else:
         print(
-            f"Generated ACS artifacts for '{result.slug}' in {out_dir} "
+            f"Generated ACS artifacts for '{result.slug}' in {terminal_text(str(out_dir))} "
             f"after {result.attempts} model call(s)."
         )
         print(
@@ -59,13 +72,14 @@ def main(argv: list[str] | None = None) -> int:
     if result.warnings:
         print("Warnings:", file=sys.stderr)
         for warning in result.warnings:
-            print(f"  - {warning}", file=sys.stderr)
+            print(f"  - {terminal_text(warning)}", file=sys.stderr)
     return 0
 
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="acs-policy-gen",
+        allow_abbrev=False,
         description=(
             "Generate an ACS manifest and Rego policy from natural-language "
             "guardrails using a language model. Artifacts are validated by the "
@@ -74,7 +88,7 @@ def _parser() -> argparse.ArgumentParser:
         ),
         epilog=(
             "Output layout: manifest.yaml, policy/<slug>.rego, report.md. "
-            "Credentials come from --api-key or ACS_GENERATOR_API_KEY and are "
+            "Credentials come from --api-key-file or ACS_GENERATOR_API_KEY and are "
             "never written to the output."
         ),
     )
@@ -120,22 +134,18 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--api-base",
-        default=os.getenv("ACS_GENERATOR_API_BASE"),
         help=f"OpenAI-compatible API base URL (default {DEFAULT_API_BASE})",
     )
     parser.add_argument(
-        "--api-key",
-        default=os.getenv("ACS_GENERATOR_API_KEY"),
-        help="API key. Prefer ACS_GENERATOR_API_KEY so the key stays out of shell history",
+        "--api-key-file",
+        help="Read a key from a UTF-8 file, or - for stdin. Alternatively set ACS_GENERATOR_API_KEY",
     )
     parser.add_argument(
         "--model",
-        default=os.getenv("ACS_GENERATOR_MODEL"),
         help=f"Provider model or deployment name (default {DEFAULT_MODEL})",
     )
     parser.add_argument(
         "--api-version",
-        default=os.getenv("ACS_GENERATOR_API_VERSION"),
         help="Azure OpenAI api-version. Setting it selects Azure api-key auth",
     )
     return parser
@@ -147,6 +157,23 @@ def _prompt(args: argparse.Namespace) -> str:
     if args.prompt_file:
         return Path(args.prompt_file).read_text(encoding="utf-8")
     return args.prompt
+
+
+def _api_key(args: argparse.Namespace) -> str | None:
+    if args.api_key_file is None:
+        return None
+    if args.api_key_file == "-":
+        if args.prompt_file == "-":
+            raise ValueError(
+                "stdin cannot supply both --api-key-file and --prompt-file"
+            )
+        key = sys.stdin.read(65537)
+    else:
+        with Path(args.api_key_file).open(encoding="utf-8") as handle:
+            key = handle.read(65537)
+    if len(key) > 65536 or not key.strip():
+        raise ValueError("API key file must be non-empty and at most 65536 characters")
+    return key.strip()
 
 
 def _tool_inventory(args: argparse.Namespace) -> dict[str, dict[str, Any]]:

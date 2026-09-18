@@ -14,6 +14,7 @@ import json
 from collections import defaultdict
 from typing import Any
 
+from .conditions import condition_source
 from .plan import PolicyPlan, RulePlan, transform_segments
 from .vocabulary import INTERVENTION_POINT_NAMES, POLICY_INPUT_POINT_KEY
 
@@ -65,10 +66,10 @@ def _render_point(point: str, rules: list[RulePlan]) -> list[str]:
         )
         lines.append(f"{head} if {{")
         lines.append(f'{INDENT}input.{POLICY_INPUT_POINT_KEY} == "{point}"')
-        for condition in rule.conditions:
-            for line in condition.splitlines():
-                if line.strip():
-                    lines.append(f"{INDENT}{line.strip()}")
+        if rule.conditions:
+            # Whitespace inside raw strings and comment termination are semantic.
+            # Emit the identical source accepted by the condition inspector.
+            lines.append(condition_source(rule.conditions))
         for line in extra_body:
             lines.append(f"{INDENT}{line}")
         lines.append("}")
@@ -87,8 +88,8 @@ def _render_verdict(rule: RulePlan) -> tuple[str, list[str]]:
 
     Only a `transform` decision may carry a value-changing payload, and it is
     a single `{path, value}` object rooted at `$target`. `allow`, `warn`,
-    `deny` and `escalate` never mutate, so their effects are dropped and
-    surfaced as a generation warning by the engine module.
+    `deny` and `escalate` never reach this renderer with effects because the
+    plan parser rejects them.
     """
     verdict = _verdict_fields(rule)
     if rule.decision != "transform":

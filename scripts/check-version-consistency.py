@@ -3,13 +3,14 @@
 # Licensed under the MIT License.
 """Fail when the version surfaces disagree.
 
-One tag releases every package together, so all version manifests MUST
-carry the same version at all times:
+Runtime packages release together. The generator shares their version metadata
+but is outside tag publication. All these manifests must agree:
 
   Cargo.toml                   [workspace.package] version   (SemVer)
   sdk/python/Cargo.toml        [package] version             (SemVer)
   sdk/python/Cargo.toml        agent-control-spec req         (SemVer)
   sdk/python/pyproject.toml    [project] version             (PEP 440)
+  generator/pyproject.toml     [project] version             (PEP 440)
   sdk/node/package.json        version                       (SemVer)
   sdk/node/npm/*/package.json  version                       (SemVer)
   sdk/dotnet csproj            <Version>                     (SemVer)
@@ -30,6 +31,8 @@ import json
 import re
 import sys
 from pathlib import Path
+
+import tomllib
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -69,6 +72,15 @@ def read_versions() -> dict[str, str]:
     m = re.search(r'^version\s*=\s*"([^"]+)"', py, re.MULTILINE)
     assert m, "no version in sdk/python/pyproject.toml"
     versions["sdk/python/pyproject.toml"] = m.group(1)
+
+    generator = tomllib.loads(
+        (ROOT / "generator/pyproject.toml").read_text(encoding="utf-8")
+    )["project"]
+    versions["generator/pyproject.toml"] = generator["version"]
+    # alpha.4 is the first SDK release containing the public authoring helper.
+    assert "agent-control-spec>=0.4.0a4,<0.5" in generator["dependencies"], (
+        "generator SDK floor must name the first authoring-enabled SDK (0.4.0a4)"
+    )
 
     pkg = json.loads((ROOT / "sdk/node/package.json").read_text(encoding="utf-8"))
     versions["sdk/node/package.json"] = pkg["version"]
