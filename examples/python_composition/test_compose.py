@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import copy
 import io
@@ -148,6 +149,12 @@ class SdkTests(unittest.TestCase):
         for target in targets:
             self.assertTrue(target.startswith("https://"), target)
         self.assert_documentation_targets_exist(path, path.read_text())
+
+    def test_example_readme_names_the_consumer_baseline(self):
+        requirements = (EXAMPLE / "requirements.txt").read_text()
+        match = re.search(r"^agent-control-spec==(\S+)$", requirements, re.MULTILINE)
+        self.assertIsNotNone(match)
+        self.assertIn(f"ACS `{match.group(1)}`", (EXAMPLE / "README.md").read_text())
 
     def test_composition_guide_is_a_complete_integration(self):
         guide = (ROOT / "docs/ACS-AND-AGENT-HOOKS.md").read_text()
@@ -311,6 +318,7 @@ class CompositionTests(unittest.IsolatedAsyncioTestCase):
                 args={"order_id": "A-1001", "amount": 40},
             )
             await refund(self.emitter, ctx, self.ledger)
+            await asyncio.sleep(0)
         self.assertEqual(len(self.emitter.results), 100)
         self.assertEqual(self.emitter.records_dropped, 400)
         drained = self.emitter.take_records()
@@ -331,6 +339,7 @@ class CompositionTests(unittest.IsolatedAsyncioTestCase):
             record = await refund(self.emitter, ctx, self.ledger)
             self.assertEqual(self.emitter.take_records(), [record])
             self.assertEqual(self.emitter.results, [])
+            await asyncio.sleep(0)
         self.assertEqual(self.emitter.records_dropped, 0)
 
     async def test_approval_profiles(self):
