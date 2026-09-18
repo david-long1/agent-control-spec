@@ -59,6 +59,7 @@ Do not use external data, network calls, clocks, randomness, print, or with over
 Do not introduce helper rules. Conditions are parsed before any evaluation.
 Condition strings may contain LF newlines, but no literal control, format, or
 Unicode line-separator characters. Use escaped Rego string literals when needed.
+Do not begin a condition body with '-'; use '0 - ...' explicitly.
 
 input.policy_target.value is the agent-hooks target at that point:
 {json.dumps(TARGET_SHAPES, indent=2)}

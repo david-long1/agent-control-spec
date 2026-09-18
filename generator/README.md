@@ -171,6 +171,9 @@ Iteration uses top-level `some` statements. Comprehensions and `every` blocks ar
 outside this single-scope authoring subset, so nested bindings cannot be mistaken
 for a regex's literal pattern.
 This is a bounded authoring subset, not a general Rego type checker.
+After leading comments and blank lines, a condition body cannot start with `-`.
+Write `0 - ...` explicitly; Regorus can otherwise attach a leading unary minus
+to the renderer's preceding guard across a newline.
 
 The native authoring helper accepts at most 64 KiB of Rego source per call and
 8 MiB of serialized AST output. A pre-parse guard limits nesting to 12 levels,
@@ -186,8 +189,11 @@ checks collected patterns with the runtime regex engine and evaluates synthetic
 contexts at every bound point. These smoke cases use empty annotation results
 and do not prove that a rule ever matches. Application-specific properties,
 regex coverage, policy completeness, and host enforcement still need tests.
-Repeated top-level iterations over the same input collection produce a warning
-because they may form a Cartesian product. The warning is not a performance bound.
+Multiple iteration clauses produce a warning because they may form a Cartesian
+product, including across different collections. This covers `some ... in`,
+wildcard lookups such as `input.x[_]`, and lookups using unbound named indices.
+Repeated uses of an already-bound index do not add an iteration. The warning
+is not a performance bound.
 
 The default verdict is allow. Rules use a first-match chain ordered
 `deny > escalate > transform > warn > allow`, with plan order breaking ties.

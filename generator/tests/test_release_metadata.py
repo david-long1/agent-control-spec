@@ -3,6 +3,7 @@
 """Release metadata gates include the separate, unpublished generator."""
 
 import importlib.util
+import re
 from pathlib import Path
 
 import pytest
@@ -23,6 +24,8 @@ def copied_metadata(tmp_path):
         destination = tmp_path / relative
         destination.parent.mkdir(parents=True, exist_ok=True)
         destination.write_bytes((module.ROOT / relative).read_bytes())
+    for relative in ("Cargo.lock", "sdk/python/Cargo.lock"):
+        (tmp_path / relative).write_bytes((module.ROOT / relative).read_bytes())
     module.ROOT = tmp_path
     return module
 
@@ -56,3 +59,21 @@ def test_floor_cannot_admit_sdk_without_authoring(tmp_path):
     )
     with pytest.raises(AssertionError, match="first authoring-enabled SDK"):
         module.read_versions()
+
+
+@pytest.mark.parametrize("relative", ["Cargo.lock", "sdk/python/Cargo.lock"])
+def test_regorus_cannot_drift_between_lockfiles(tmp_path, capsys, relative):
+    module = copied_metadata(tmp_path)
+    path = tmp_path / relative
+    source, count = re.subn(
+        r'(\[\[package\]\]\nname = "regorus"\nversion = ")[^"]+',
+        r"\g<1>0.12.99",
+        path.read_text(encoding="utf-8"),
+    )
+    assert count == 1
+    path.write_text(source, encoding="utf-8")
+    assert module.main() == 1
+    diagnostic = capsys.readouterr().out
+    assert "Regorus versions disagree" in diagnostic
+    assert "Cargo.lock:" in diagnostic
+    assert "sdk/python/Cargo.lock:" in diagnostic

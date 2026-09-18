@@ -43,10 +43,12 @@ Before any separate generator publication, the required SDK must be available
 from the package registry. Setting version metadata does not publish either package.
 
 The Python binding pins Regorus exactly for its serialized AST. When changing
-that pin, regenerate `sdk/python/Cargo.lock`, update the native AST version marker
+that pin, update both root and `sdk/python/Cargo.lock` resolutions, update the native AST version marker
 and the generator's supported-version gate, and review the AST adapter against
 the resolved crate. `sdk/python/tests/test_authoring.py` compares the compiled
 marker to both the manifest pin and resolved lockfile, so a stale marker fails CI.
+The version consistency check also compares Regorus in both lockfiles, preventing
+separate dependency updates from moving Python and the other bindings apart.
 The parser remains Python-only authoring tooling; the binding-coverage script
 records that decision separately from the runtime's cross-language contract.
 

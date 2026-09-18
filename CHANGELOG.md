@@ -15,6 +15,10 @@
 - Prepare version `0.4.0-alpha.4` across runtime and generator metadata.
   The generator requires SDK `0.4.0a4` and shares the version consistency check,
   but remains outside the tag-driven publication workflow.
+- Require root and Python Cargo lockfiles to resolve the same Regorus version.
+  Generator iteration warnings cover wildcard and unbound-index lookups across
+  collections. Leading unary-minus condition bodies are rejected before they can
+  attach to a generated guard across a newline.
 
 - A manifest chain that fetches any `extends` URL is now URL sourced, and a
   URL sourced manifest may not read host secrets. A fetched document could

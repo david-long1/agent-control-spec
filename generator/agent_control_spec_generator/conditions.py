@@ -24,6 +24,17 @@ def condition_source(conditions: tuple[str, ...]) -> str:
             raise ConditionError(
                 f"condition contains forbidden character U+{ord(char):04X}"
             )
+    for line in source.split("\n"):
+        first = line.lstrip(" ")
+        if not first or first.startswith("#"):
+            continue
+        if first.startswith("-"):
+            # Regorus continues arithmetic across LF. Otherwise this unary
+            # expression can attach to the renderer's preceding point guard.
+            raise ConditionError(
+                "condition body cannot start with '-'; write '0 - ...' explicitly"
+            )
+        break
     return source
 
 
@@ -505,18 +516,63 @@ def inspect_conditions(conditions: tuple[str, ...], point: str) -> ConditionInfo
         raise ConditionError(
             "a constant body selects every request or none; conditions must read input"
         )
-    iterations: dict[tuple[Any, ...], int] = {}
+    iterations: list[tuple[Any, ...]] = []
+    bound_variables = {
+        args[0]["value"]
+        for name, args in calls
+        if name == "assign" and args and args[0].get("type") == "var"
+    }
     for statement in tree["body"]:
         if statement.get("iteration"):
-            collection = resolved(statement["terms"]["value"][-1])
-            if collection and collection[0] == "input":
-                iterations[collection] = iterations.get(collection, 0) + 1
-    warnings = tuple(
-        f"{count} iterations over {'.'.join(str(part) for part in collection)} at "
-        f"{point} can form a Cartesian product; test realistic input sizes"
-        for collection, count in iterations.items()
-        if count > 1
-    )
+            args = statement["terms"]["value"][1:]
+            iterations.append(resolved(args[-1]) or ("computed collection",))
+            bound_variables.update(
+                arg["value"] for arg in args[:-1] if arg.get("type") == "var"
+            )
+
+    def bound_index(term: dict[str, Any], seen: tuple[str, ...] = ()) -> bool:
+        if term.get("type") != "var":
+            # Any enumeration within a compound RHS is counted at its own ref.
+            return True
+        name = term["value"]
+        if name == "_":
+            return False
+        if name in bound_variables:
+            return True
+        if name in seen:
+            return False
+        return any(bound_index(rhs, (*seen, name)) for rhs in bindings.get(name, []))
+
+    seen_indices: set[str] = set()
+    for node in nodes:
+        if node.get("type") != "ref":
+            continue
+        parts = node["value"]
+        for index, selector in enumerate(parts[1:], 1):
+            if selector.get("type") != "var" or bound_index(selector):
+                continue
+            name = selector["value"]
+            if name != "_" and name in seen_indices:
+                continue
+            # A wildcard is a fresh dimension on every occurrence; a named
+            # unbound index enumerates once and subsequent uses join on it.
+            collection = resolved({"type": "ref", "value": parts[:index]})
+            iterations.append(collection or ("computed collection",))
+            seen_indices.add(name)
+    warnings = ()
+    if len(iterations) > 1:
+        collections = ", ".join(
+            dict.fromkeys(
+                ".".join("[*]" if part is None else str(part) for part in collection)
+                for collection in iterations
+            )
+        )
+        warnings = (
+            (
+                f"{len(iterations)} iteration clauses at {point} over {collections} "
+                "can form a Cartesian product; test realistic input sizes"
+            ),
+        )
     return ConditionInfo(
         tuple(dict.fromkeys(patterns)),
         frozenset(annotators),

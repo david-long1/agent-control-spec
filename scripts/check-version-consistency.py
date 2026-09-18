@@ -102,6 +102,19 @@ def read_versions() -> dict[str, str]:
 
 def main() -> int:
     versions = read_versions()
+    regorus = {}
+    for relative in ("Cargo.lock", "sdk/python/Cargo.lock"):
+        lock = tomllib.loads((ROOT / relative).read_text(encoding="utf-8"))
+        resolved = [p["version"] for p in lock["package"] if p["name"] == "regorus"]
+        assert len(resolved) == 1, (
+            f"{relative} must resolve exactly one Regorus version"
+        )
+        regorus[relative] = resolved[0]
+    if len(set(regorus.values())) != 1:
+        print("::error::Regorus versions disagree across runtime and Python lockfiles:")
+        for path, version in regorus.items():
+            print(f"  {path}: {version}")
+        return 1
     normalized = {path: normalize(v) for path, v in versions.items()}
     if len(set(normalized.values())) == 1:
         print(f"version surfaces agree: {next(iter(normalized.values()))}")
