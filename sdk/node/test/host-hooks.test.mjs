@@ -247,6 +247,43 @@ test("reading an annotation without declaring it in needs is refused", () => {
   );
 });
 
+test("an annotation dependency cycle is refused before dispatch", () => {
+  const src = fs
+    .readFileSync(writeChainedAnnotatorManifest(workdir), "utf8")
+    .replace(
+      '      scan:\n        from: "$target.content"',
+      '      scan:\n        needs: [judge]\n        from: "$target.content"',
+    );
+  const p = path.join(workdir, "cyclic-annotation-manifest.yaml");
+  fs.writeFileSync(p, src, "utf8");
+  const calls = [];
+
+  assert.throws(
+    () =>
+      AcsInterceptor.fromPath(p, {
+        annotatorDispatcher: (name) => {
+          calls.push(name);
+          return {};
+        },
+        policyDispatcher: () => {
+          calls.push("policy");
+          return { decision: "allow" };
+        },
+      }),
+    (error) => {
+      assert.equal(error.constructor, Error);
+      assert.equal(
+        error.message.split(": ").shift(),
+        "runtime_error:manifest_invalid",
+      );
+      assert.match(error.message, /cycle/);
+      assert.match(error.message, /judge, scan/);
+      return true;
+    },
+  );
+  assert.deepEqual(calls, []);
+});
+
 // ---------------------------------------------------------------------
 // 2. An annotator that throws fails CLOSED. The verdict is a deny with
 // `runtime_error:annotation_failed`. The engine never treats a thrown

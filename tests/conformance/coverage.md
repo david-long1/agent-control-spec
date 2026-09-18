@@ -38,7 +38,6 @@ Dependency coverage must also distinguish ready-set ordering from layer batching
 direct dependencies from transitive ones, and selected `from` values from the full
 dependency outputs and snapshot still visible to dispatchers. Other required
 checks are declaration-level `needs` rejection, fetched-declaration provenance
-restrictions, version-aware invocation stripping without changing the public Rust
-`AnnotationConfig { from, fields }` shape or legacy constructor behavior,
+restrictions, version-aware invocation stripping and legacy field forwarding,
 preliminary and staged input depth checks without an early aggregate byte cap,
 and JSON-encoded array strings in `metadata.annotation_needs` without payloads.

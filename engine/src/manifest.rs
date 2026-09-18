@@ -819,7 +819,8 @@ impl Manifest {
     }
 
     pub(crate) fn annotation_chaining_enabled(&self) -> bool {
-        self.agent_control_specification_version.trim() == manifest_version::ANNOTATION_CHAINING
+        manifest_version::contract(&self.agent_control_specification_version)
+            .is_some_and(|contract| contract.annotation_chaining)
     }
 
     /// Keep the original public config shape and legacy extension values.
@@ -1184,7 +1185,7 @@ pub(crate) fn annotation_dispatch_order(
             .collect();
         cycle.sort_unstable();
         return Err(RuntimeError::ManifestInvalid(format!(
-            "intervention point {intervention_point} has a cycle among annotation needs involving: {}",
+            "intervention point {intervention_point} has unresolvable annotation needs (cycle or blocked by one) among: {}",
             cycle.join(", ")
         )));
     }
@@ -3659,33 +3660,70 @@ intervention_points:
         );
     }
 
+    #[test]
+    fn host_binding_cannot_make_fetched_annotator_need_host_result() {
+        let remote = "agent_control_specification_version: 0.5.0-alpha.1\nannotators:\n  judge:\n    type: llm\n    endpoint: https://judge.remote.example/v1\n";
+        let path = root_path(
+            "url-host-binding-needs-host-result.yaml",
+            &format!(
+                "agent_control_specification_version: 0.5.0-alpha.1\nextends:\n  - {REMOTE}\n{TEST_POLICY_INPUT_POINT}    annotations:\n      scanner:\n        from: $target.text\n      judge:\n        needs: [scanner]\n        from: $pi.annotations.scanner.label\nannotators:\n  scanner:\n    type: classifier\n"
+            ),
+        );
+        let fetcher = fetcher_with(REMOTE, remote);
+
+        let error = load_with_fetcher(&path, fetcher.clone(), Limits::default())
+            .expect_err("a host binding cannot expose host results to a fetched annotator");
+
+        assert_eq!(fetcher.calls(REMOTE), 1);
+        assert_url_sourced_refusal(
+            &error,
+            &[
+                "needs 'scanner', which the host declared",
+                "annotator 'judge', which a fetched document declared",
+                "fetched documents: https://policy.example/base.yaml",
+            ],
+        );
+    }
+
     /// Two fetched documents may chain each other, the same way they may
     /// overlay each other. Nothing of the host's crosses the boundary.
     #[test]
     fn two_fetched_documents_may_chain_their_own_annotators() {
-        let remote = "agent_control_specification_version: 0.4.0-alpha.1\nannotators:\n  judge:\n    type: llm\n    endpoint: https://judge.remote.example/v1\n  scanner:\n    type: classifier\nintervention_points:\n  output:\n    policy_target: $snap.output\n    policy:\n      id: p\n    annotations:\n      scanner:\n        from: $target.text\n      judge:\n        needs: [scanner]\n        from: $pi.annotations.scanner.label\n";
-        let path = root_extending_url(
+        let scanner_url = "https://a.example/scanner.yaml";
+        let judge_url = "https://b.example/judge.yaml";
+        let scanner = "agent_control_specification_version: 0.5.0-alpha.1\nannotators:\n  scanner:\n    type: classifier\nintervention_points:\n  output:\n    annotations:\n      scanner:\n        from: $target.text\n";
+        let judge = "agent_control_specification_version: 0.5.0-alpha.1\nannotators:\n  judge:\n    type: llm\n    endpoint: https://judge.remote.example/v1\nintervention_points:\n  output:\n    policy_target: $snap.output\n    policy:\n      id: p\n    annotations:\n      judge:\n        needs: [scanner]\n        from: $pi.annotations.scanner.label\n";
+        let path = root_path(
             "url-two-fetched-chain.yaml",
-            REMOTE,
-            TEST_POLICY_INPUT_POINT,
+            &format!(
+                "agent_control_specification_version: 0.5.0-alpha.1\nextends:\n  - url: {scanner_url}\n    integrity: {}\n  - {judge_url}\n{TEST_POLICY_INPUT_POINT}",
+                sri(scanner.as_bytes())
+            ),
         );
-
-        fs::write(
-            &path,
-            fs::read_to_string(&path)
-                .unwrap()
-                .replace("0.4.0-alpha.1", "0.5.0-alpha.1"),
-        )
-        .unwrap();
-        let remote = remote.replace("0.4.0-alpha.1", "0.5.0-alpha.1");
-        let manifest = load_with_fetcher(&path, fetcher_with(REMOTE, &remote), Limits::default())
-            .expect("a fetched document may chain annotators it declared itself");
+        let fetcher = MockFetcher::new(BTreeMap::from([
+            (scanner_url.to_string(), scanner.as_bytes().to_vec()),
+            (judge_url.to_string(), judge.as_bytes().to_vec()),
+        ]));
+        let manifest = load_with_fetcher(&path, fetcher.clone(), Limits::default())
+            .expect("fetched documents share one trust class, pinned or not");
 
         let judge = &manifest.intervention_points[&InterceptionPoint::Output].annotations["judge"];
         assert_eq!(
             manifest.annotation_dependencies(judge).unwrap(),
             vec!["scanner"]
         );
+        assert_eq!(fetcher.calls(scanner_url), 1);
+        assert_eq!(fetcher.calls(judge_url), 1);
+        assert_eq!(
+            manifest.url_sources(),
+            [scanner_url.to_string(), judge_url.to_string()]
+        );
+        for name in ["scanner", "judge"] {
+            assert!(manifest.url_sourced_annotators.contains(name));
+            assert!(manifest
+                .url_sourced_annotations
+                .contains(&(InterceptionPoint::Output, name.to_string())));
+        }
     }
 
     /// Two fetched documents may overlay each other: one declares the

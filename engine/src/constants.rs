@@ -26,8 +26,39 @@ pub mod reserved_reason {
 }
 
 pub(crate) mod manifest_version {
+    #[derive(Clone, Copy)]
+    pub(crate) struct Contract {
+        pub name: &'static str,
+        pub annotation_chaining: bool,
+    }
+
     pub(crate) const ANNOTATION_CHAINING: &str = "0.5.0-alpha.1";
-    pub(crate) const SUPPORTED: [&str; 2] = ["0.4.0-alpha.1", ANNOTATION_CHAINING];
+    pub(crate) const CONTRACTS: &[Contract] = &[
+        Contract {
+            name: "0.4.0-alpha.1",
+            annotation_chaining: false,
+        },
+        Contract {
+            name: ANNOTATION_CHAINING,
+            annotation_chaining: true,
+        },
+    ];
+    pub(crate) const SUPPORTED: [&str; CONTRACTS.len()] = {
+        let mut names = [""; CONTRACTS.len()];
+        let mut index = 0;
+        while index < CONTRACTS.len() {
+            names[index] = CONTRACTS[index].name;
+            index += 1;
+        }
+        names
+    };
+
+    pub(crate) fn contract(version: &str) -> Option<Contract> {
+        CONTRACTS
+            .iter()
+            .copied()
+            .find(|contract| contract.name == version.trim())
+    }
 }
 
 pub(crate) mod engine {

@@ -495,6 +495,87 @@ fn the_same_graph_evaluates_identically_every_time() {
 }
 
 #[test]
+fn input_and_output_graphs_have_independent_order_and_evaluation_state() {
+    let loaded = Manifest::from_yaml_str(
+        r#"agent_control_specification_version: 0.5.0-alpha.1
+policies:
+  test_policy:
+    type: test
+annotators:
+  alpha:
+    type: classifier
+  beta:
+    type: classifier
+intervention_points:
+  input:
+    policy_target: $snap.input
+    policy:
+      id: test_policy
+    annotations:
+      alpha:
+        from: $target.text
+      beta:
+        needs: [alpha]
+        from: $pi.annotations.alpha.label
+  output:
+    policy_target: $snap.output
+    policy:
+      id: test_policy
+    annotations:
+      alpha:
+        needs: [beta]
+        from: $pi.annotations.beta.label
+      beta:
+        from: $target.text
+"#,
+    )
+    .unwrap();
+    let annotator = ChainAnnotator::new();
+    let policy = CapturingPolicy::new();
+    let runtime = Runtime::new(loaded, annotator.clone(), policy.clone()).unwrap();
+
+    for (round, (point, upstream, downstream, text)) in [
+        (InterceptionPoint::Input, "alpha", "beta", "input text"),
+        (InterceptionPoint::Output, "beta", "alpha", "output text"),
+        (InterceptionPoint::Input, "alpha", "beta", "input text"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let upstream_output = json!({"label": format!("upstream-{round}")});
+        let downstream_output = json!({"label": format!("downstream-{round}")});
+        annotator.set_output(upstream, upstream_output.clone());
+        annotator.set_output(downstream, downstream_output.clone());
+        let result = runtime.evaluate_point(
+            point,
+            json!({"input": {"text": "input text"}, "output": {"text": "output text"}}),
+        );
+        assert_eq!(result.verdict.decision, Decision::Allow);
+        let calls = annotator.calls();
+        assert_eq!(calls.len(), (round + 1) * 2);
+        let calls = &calls[round * 2..];
+        assert_eq!(calls[0].name, upstream);
+        assert_eq!(calls[1].name, downstream);
+        assert_eq!(calls[0].visible_annotations, json!({}));
+        assert_eq!(calls[0].resolved_from, Some(json!(text)));
+        assert_eq!(
+            calls[1].visible_annotations,
+            json!({(upstream): upstream_output.clone()})
+        );
+        assert_eq!(
+            calls[1].resolved_from,
+            Some(upstream_output["label"].clone())
+        );
+        assert_eq!(policy.seen.lock().unwrap().len(), round + 1);
+        assert_eq!(
+            policy.final_annotations(),
+            json!({(upstream): upstream_output, (downstream): downstream_output}),
+            "each evaluation must use only fresh results from its own point"
+        );
+    }
+}
+
+#[test]
 fn fan_in_shows_every_declared_need() {
     let annotator = ChainAnnotator::new();
     annotator.set_output("alpha", json!({"value": 1}));
@@ -610,6 +691,22 @@ fn a_cycle_is_rejected() {
 }
 
 #[test]
+fn a_cycle_reports_downstream_nodes_as_unresolved_not_as_cycle_members() {
+    let detail = load_error(
+        "      alpha:\n        needs: [beta]\n        from: $pi.annotations.beta.value\n\
+         \x20     beta:\n        needs: [alpha]\n        from: $pi.annotations.alpha.value\n\
+         \x20     gamma:\n        needs: [alpha]\n        from: $pi.annotations.alpha.value\n",
+        THREE_CLASSIFIERS,
+    );
+    assert!(
+        detail.contains(
+            "unresolvable annotation needs (cycle or blocked by one) among: alpha, beta, gamma"
+        ),
+        "gamma is blocked downstream, not a member of the alpha/beta cycle: {detail}"
+    );
+}
+
+#[test]
 fn a_longer_cycle_is_rejected() {
     let detail = load_error(
         "      alpha:\n        needs: [gamma]\n        from: $pi.annotations.gamma.value\n\
@@ -650,6 +747,48 @@ fn needing_an_annotator_the_point_does_not_opt_into_is_rejected() {
         detail.contains("which the point does not opt into"),
         "{detail}"
     );
+}
+
+#[test]
+fn needing_an_annotation_bound_only_at_another_point_is_rejected() {
+    let error = Manifest::from_yaml_str(
+        r#"agent_control_specification_version: 0.5.0-alpha.1
+policies:
+  test_policy:
+    type: test
+annotators:
+  alpha:
+    type: classifier
+  beta:
+    type: classifier
+intervention_points:
+  input:
+    policy_target: $snap.input
+    policy:
+      id: test_policy
+    annotations:
+      alpha:
+        from: $target.text
+  output:
+    policy_target: $snap.output
+    policy:
+      id: test_policy
+    annotations:
+      beta:
+        needs: [alpha]
+        from: $target.text
+"#,
+    )
+    .expect_err("a binding at input cannot satisfy a need at output");
+    assert_eq!(error.reason(), "runtime_error:manifest_invalid");
+    for needle in [
+        "output",
+        "beta",
+        "alpha",
+        "which the point does not opt into",
+    ] {
+        assert!(error.detail().contains(needle), "{error}");
+    }
 }
 
 #[test]
@@ -762,7 +901,7 @@ fn programmatic_needs_uses_the_same_validation_and_serialization() {
         loaded
     );
     assert_eq!(
-        Manifest::from_yaml_str(&serde_yaml::to_string(&loaded).unwrap()).unwrap(),
+        Manifest::from_yaml_str(&serde_json::to_string(&loaded).unwrap()).unwrap(),
         loaded
     );
 }
@@ -905,7 +1044,9 @@ fn merged_chains_require_one_contract_version_and_preserve_needs() {
         "      alpha:\n        from: $target\n      beta:\n        needs: [alpha]\n        from: $target\n",
         TWO_CLASSIFIERS,
     ).unwrap();
-    let source = serde_yaml::to_string(&loaded).unwrap();
+    // JSON is a YAML subset, so this exercises the YAML loader without a
+    // dependency on the YAML parser's serialization API.
+    let source = serde_json::to_string(&loaded).unwrap();
     let merged = Manifest::from_yaml_chain(&[source.as_str(), source.as_str()]).unwrap();
     assert_eq!(
         merged.intervention_points[&InterceptionPoint::Input].annotations["beta"].fields["needs"],
@@ -921,6 +1062,47 @@ fn merged_chains_require_one_contract_version_and_preserve_needs() {
 }
 
 #[test]
+fn extends_duplicate_bindings_conflict_when_child_adds_needs_even_if_empty() {
+    let parent = manifest(
+        "      alpha:\n        from: $target\n      beta:\n        from: $target\n",
+        TWO_CLASSIFIERS,
+    )
+    .unwrap();
+    let parent_source = serde_json::to_string(&parent).unwrap();
+    for needs in [json!(["alpha"]), json!([])] {
+        let mut child = parent.clone();
+        child
+            .intervention_points
+            .get_mut(&InterceptionPoint::Input)
+            .unwrap()
+            .annotations
+            .get_mut("beta")
+            .unwrap()
+            .fields
+            .insert("needs".into(), needs);
+        let child_source = serde_json::to_string(&child).unwrap();
+        // Bindings merge as whole definitions: even an explicit empty
+        // needs array differs from an omitted one, rather than adding to it.
+        for sources in [
+            [parent_source.as_str(), child_source.as_str()],
+            [child_source.as_str(), parent_source.as_str()],
+        ] {
+            let error = Manifest::from_yaml_chain(&sources).unwrap_err();
+            assert_eq!(error.reason(), "runtime_error:manifest_invalid");
+            assert!(
+                error.detail().contains(
+                    "manifest extends conflict for intervention_points.input.annotations.beta"
+                ),
+                "{error}"
+            );
+        }
+        let merged =
+            Manifest::from_yaml_chain(&[child_source.as_str(), child_source.as_str()]).unwrap();
+        assert_eq!(merged, child, "identical duplicate bindings still merge");
+    }
+}
+
+#[test]
 fn same_version_merges_ignore_surrounding_whitespace() {
     let mut loaded = manifest(
         "      alpha:\n        from: $target\n      beta:\n        needs: [alpha]\n        from: $target\n",
@@ -928,10 +1110,10 @@ fn same_version_merges_ignore_surrounding_whitespace() {
     ).unwrap();
     for version in ["0.4.0-alpha.1", "0.5.0-alpha.1"] {
         loaded.agent_control_specification_version = version.into();
-        let plain = serde_yaml::to_string(&loaded).unwrap();
+        let plain = serde_json::to_string(&loaded).unwrap();
         for padding in [" ", "\t\n", "\u{85}", "\u{a0}", "\u{3000}"] {
             loaded.agent_control_specification_version = format!("{padding}{version}{padding}");
-            let padded = serde_yaml::to_string(&loaded).unwrap();
+            let padded = serde_json::to_string(&loaded).unwrap();
             for inputs in [
                 [plain.as_str(), padded.as_str()],
                 [padded.as_str(), plain.as_str()],
@@ -946,17 +1128,35 @@ fn same_version_merges_ignore_surrounding_whitespace() {
     }
 }
 
-#[cfg(feature = "opa")]
 #[test]
 fn file_extends_uses_the_same_version_comparison() {
-    let directory = tempfile::tempdir().unwrap();
+    struct TempDirectory(std::path::PathBuf);
+
+    impl Drop for TempDirectory {
+        fn drop(&mut self) {
+            if let Err(error) = std::fs::remove_dir_all(&self.0) {
+                eprintln!("failed to clean up {}: {error}", self.0.display());
+            }
+        }
+    }
+
+    let path = std::env::temp_dir().join(format!(
+        "acs-annotation-chaining-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir(&path).unwrap();
+    let directory = TempDirectory(path);
     let loaded = manifest("      alpha:\n        from: $target\n", TWO_CLASSIFIERS).unwrap();
     std::fs::write(
-        directory.path().join("parent.yaml"),
-        serde_yaml::to_string(&loaded).unwrap(),
+        directory.0.join("parent.yaml"),
+        serde_json::to_string(&loaded).unwrap(),
     )
     .unwrap();
-    let root = directory.path().join("root.json");
+    let root = directory.0.join("root.json");
     std::fs::write(
         &root,
         json!({

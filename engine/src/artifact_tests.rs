@@ -809,6 +809,53 @@ fn artifact_schema_admits_annotation_needs() {
         })
     };
 
+    let spec = std::fs::read_to_string(directory.join("../SPECIFICATION.md")).unwrap();
+    let changelog = std::fs::read_to_string(directory.join("../../CHANGELOG.md")).unwrap();
+    assert_eq!(
+        crate::SUPPORTED_VERSIONS
+            .iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            .len(),
+        crate::SUPPORTED_VERSIONS.len(),
+        "contract names must be unique"
+    );
+    assert!(spec.lines().take(4).any(|line| line.contains(&format!(
+        "version `{}`",
+        crate::constants::manifest_version::ANNOTATION_CHAINING
+    ))));
+    for version in crate::SUPPORTED_VERSIONS {
+        let contract = crate::constants::manifest_version::contract(version).unwrap();
+        assert!(
+            changelog.contains(version),
+            "document supported contract {version}"
+        );
+        document["agent_control_specification_version"] = json!(version);
+        for needs in [json!(["scan"]), json!(null)] {
+            document["intervention_points"]["input"]["annotations"] =
+                annotations(json!({"needs": needs, "from": "$target"}));
+            let valid = needs.is_array() || !contract.annotation_chaining;
+            assert_eq!(
+                validator.is_valid(&document),
+                valid,
+                "schema contract {version}"
+            );
+            assert_eq!(
+                Manifest::from_json_str(&document.to_string()).is_ok(),
+                valid,
+                "engine contract {version}"
+            );
+        }
+        document["intervention_points"]["input"]["annotations"] =
+            annotations(json!({"needs": ["missing"], "from": "$target"}));
+        assert_eq!(
+            Manifest::from_json_str(&document.to_string()).is_err(),
+            contract.annotation_chaining,
+            "unknown dependency in {version}"
+        );
+    }
+    document["agent_control_specification_version"] =
+        json!(crate::constants::manifest_version::ANNOTATION_CHAINING);
+
     // An annotation with no `needs` at all stays valid, as every
     // manifest written before `needs` existed is.
     document["intervention_points"]["input"]["annotations"] =
@@ -858,7 +905,7 @@ fn artifact_schema_admits_annotation_needs() {
         .collect();
     boundary_chars.extend(['\u{feff}', '\u{180e}', '\u{200b}']);
     for c in boundary_chars {
-        for version in ["0.4.0-alpha.1", "0.5.0-alpha.1"] {
+        for version in crate::SUPPORTED_VERSIONS {
             document["agent_control_specification_version"] = json!(format!("{c}{version}{c}"));
             for needs in [json!(["scan"]), json!(null)] {
                 document["intervention_points"]["input"]["annotations"] =

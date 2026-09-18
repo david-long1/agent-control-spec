@@ -296,7 +296,7 @@ def test_annotator_dependency_failure_fails_closed_without_running_dependent():
 
     assert calls == ["scan"], "the dependent annotation must not be dispatched"
     assert verdict.decision.value == "deny"
-    assert verdict.reason.startswith("runtime_error:"), verdict.reason
+    assert verdict.reason == "runtime_error:annotation_failed"
 
 
 def test_annotation_reading_an_undeclared_annotation_is_rejected():

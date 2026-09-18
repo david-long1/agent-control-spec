@@ -9,6 +9,12 @@
   `needs` setting first; see specification sections 2.1 and 10.1.
   This is an unreleased contract change, not a release or package bump;
   package versions remain `0.4.0-alpha.3`.
+  The manifest schema now rejects unsupported versions rather than leaving that
+  check solely to the runtime. Version validation and composition use the Unicode
+  `White_Space` property when trimming surrounding characters.
+  The runtime prepares dependency order and metadata once at construction and
+  reuses one staged snapshot copy per evaluation. Consumers still copy their
+  dependency outputs, so dispatch cost grows with the volume of those outputs.
 
 - A manifest chain that fetches any `extends` URL is now URL sourced, and a
   URL sourced manifest may not read host secrets. A fetched document could

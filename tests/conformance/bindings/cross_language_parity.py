@@ -547,6 +547,23 @@ fn main() {
     output["dependency_new_blocked"] = dependency_case(&dependencies_manifest, true);
     output["dependency_new_clear"] = dependency_case(&dependencies_manifest, false);
     output["dependency_legacy"] = dependency_case(&legacy_manifest, false);
+    let mut supported_versions = agent_control_spec::SUPPORTED_VERSIONS.to_vec();
+    supported_versions.sort_unstable();
+    let source = std::fs::read_to_string(&dependencies_manifest).expect("dependency fixture");
+    let work = std::path::Path::new(&legacy_manifest).parent().expect("temporary workspace");
+    let mut version_cases = serde_json::Map::new();
+    for (index, version) in supported_versions.iter().enumerate() {
+        let path = work.join(format!("rust-{index}.yaml"));
+        std::fs::write(&path, source.replacen(DEPENDENCY_VERSION, version, 1))
+            .expect("versioned dependency fixture");
+        let path = path.to_str().expect("fixture path");
+        version_cases.insert((*version).to_string(), serde_json::json!({
+            "blocked": dependency_case(path, true),
+            "clear": dependency_case(path, false),
+        }));
+    }
+    output["supported_versions"] = serde_json::json!(supported_versions);
+    output["dependency_by_version"] = version_cases.into();
     println!("{output}");
 }
 """
@@ -608,6 +625,7 @@ serde_json = "1"
 def python_binding(legacy_manifest: Path) -> dict:
     script = f"""
 import json
+from pathlib import Path
 from agent_control_spec import (
     AcsInterceptor, ActivatedPolicy, StreamSession,
     supported_manifest_versions, validate_manifest,
@@ -691,6 +709,17 @@ def dependency_case(path, blocked):
     verdict = runtime.intercept({{"interception_point": "input", "input": {{"blocked": blocked}}}})
     return {{"calls": calls, "judge": seen_judge, "decision": decision(verdict), "reason": verdict.reason}}
 
+_supported_versions = sorted(supported_manifest_versions())
+_dependency_source = Path({str(DEPENDENCIES_MANIFEST)!r}).read_text()
+_dependency_by_version = {{}}
+for _index, _version in enumerate(_supported_versions):
+    _path = Path({str(legacy_manifest.parent)!r}) / f"python-{{_index}}.yaml"
+    _path.write_text(_dependency_source.replace({DEPENDENCY_VERSION!r}, _version, 1))
+    _dependency_by_version[_version] = {{
+        "blocked": dependency_case(str(_path), True),
+        "clear": dependency_case(str(_path), False),
+    }}
+
 _benign = _Classifier(1)
 _b = _hook(_benign)
 _h = _hook(_Classifier(7))
@@ -735,9 +764,11 @@ print(json.dumps({{
     "residue_kind": _res_done["reason"]["kind"],
     "residue_reason": _res_done["reason"].get("reason"),
     "residue_clean": _res_done["is_clean"],
-    "supported_versions_nonempty": len(supported_manifest_versions()) > 0,
-    "supports_dependency_version": {DEPENDENCY_VERSION!r} in supported_manifest_versions(),
-    "supports_legacy_version": {LEGACY_VERSION!r} in supported_manifest_versions(),
+    "supported_versions_nonempty": len(_supported_versions) > 0,
+    "supports_dependency_version": {DEPENDENCY_VERSION!r} in _supported_versions,
+    "supports_legacy_version": {LEGACY_VERSION!r} in _supported_versions,
+    "supported_versions": _supported_versions,
+    "dependency_by_version": _dependency_by_version,
     "dependency_new_blocked": dependency_case({str(DEPENDENCIES_MANIFEST)!r}, True),
     "dependency_new_clear": dependency_case({str(DEPENDENCIES_MANIFEST)!r}, False),
     "dependency_legacy": dependency_case({str(legacy_manifest)!r}, False),
@@ -822,6 +853,17 @@ function dependencyCase(path, blocked) {{
   const verdict = runtime.intercept({{ interception_point: 'input', input: {{ blocked }} }});
   return {{ calls, judge, decision: String(verdict.decision).toLowerCase(), reason: verdict.reason ?? null }};
 }}
+const supportedVersions = [...acs.supportedManifestVersions()].sort();
+const dependencySource = fs.readFileSync({json.dumps(str(DEPENDENCIES_MANIFEST))}, 'utf8');
+const dependencyByVersion = {{}};
+for (const [index, version] of supportedVersions.entries()) {{
+  const path = require('path').join({json.dumps(str(legacy_manifest.parent))}, `node-${{index}}.yaml`);
+  fs.writeFileSync(path, dependencySource.replace({json.dumps(DEPENDENCY_VERSION)}, () => version));
+  dependencyByVersion[version] = {{
+    blocked: dependencyCase(path, true),
+    clear: dependencyCase(path, false),
+  }};
+}}
 let hookCalls = 0;
 const b = hook(() => {{ hookCalls++; return {{ severity: 1 }}; }});
 const hh = hook(() => ({{ severity: 7 }}));
@@ -868,9 +910,11 @@ console.log(JSON.stringify({{
   residue_kind: resDone.reason.kind,
   residue_reason: resDone.reason.reason ?? null,
   residue_clean: resDone.isClean,
-  supported_versions_nonempty: acs.supportedManifestVersions().length > 0,
-  supports_dependency_version: acs.supportedManifestVersions().includes({json.dumps(DEPENDENCY_VERSION)}),
-  supports_legacy_version: acs.supportedManifestVersions().includes({json.dumps(LEGACY_VERSION)}),
+  supported_versions_nonempty: supportedVersions.length > 0,
+  supports_dependency_version: supportedVersions.includes({json.dumps(DEPENDENCY_VERSION)}),
+  supports_legacy_version: supportedVersions.includes({json.dumps(LEGACY_VERSION)}),
+  supported_versions: supportedVersions,
+  dependency_by_version: dependencyByVersion,
   dependency_new_blocked: dependencyCase({json.dumps(str(DEPENDENCIES_MANIFEST))}, true),
   dependency_new_clear: dependencyCase({json.dumps(str(DEPENDENCIES_MANIFEST))}, false),
   dependency_legacy: dependencyCase({json.dumps(str(legacy_manifest))}, false),
@@ -986,6 +1030,21 @@ static object DependencyCase(string path, bool blocked)
     return new { calls, judge, decision = verdict.Decision.ToString().ToLowerInvariant(), reason = verdict.Reason };
 }
 
+var supportedVersions = AcsManifest.SupportedVersions().OrderBy(v => v, StringComparer.Ordinal).ToList();
+var dependencySource = File.ReadAllText(DEPENDENCIES_MANIFEST);
+var dependencyByVersion = new Dictionary<string, object>();
+for (var index = 0; index < supportedVersions.Count; index++)
+{
+    var version = supportedVersions[index];
+    var path = Path.Combine(Path.GetDirectoryName(LEGACY_MANIFEST)!, $"dotnet-{index}.yaml");
+    File.WriteAllText(path, dependencySource.Replace(DEPENDENCY_VERSION, version));
+    dependencyByVersion[version] = new
+    {
+        blocked = DependencyCase(path, true),
+        clear = DependencyCase(path, false),
+    };
+}
+
 var hookCalls = 0;
 var b = Hook((_, _, _) => { hookCalls++; return SEV1; });
 var hh = Hook((_, _, _) => SEV7);
@@ -1035,9 +1094,11 @@ Console.WriteLine(JsonSerializer.Serialize(new Dictionary<string, object?>
     ["residue_kind"] = residueDone.Reason.Kind,
     ["residue_reason"] = residueDone.Reason.Reason,
     ["residue_clean"] = residueDone.IsClean,
-    ["supported_versions_nonempty"] = AcsManifest.SupportedVersions().Count > 0,
-    ["supports_dependency_version"] = AcsManifest.SupportedVersions().Contains(DEPENDENCY_VERSION),
-    ["supports_legacy_version"] = AcsManifest.SupportedVersions().Contains(LEGACY_VERSION),
+    ["supported_versions_nonempty"] = supportedVersions.Count > 0,
+    ["supports_dependency_version"] = supportedVersions.Contains(DEPENDENCY_VERSION),
+    ["supports_legacy_version"] = supportedVersions.Contains(LEGACY_VERSION),
+    ["supported_versions"] = supportedVersions,
+    ["dependency_by_version"] = dependencyByVersion,
     ["dependency_new_blocked"] = DependencyCase(DEPENDENCIES_MANIFEST, true),
     ["dependency_new_clear"] = DependencyCase(DEPENDENCIES_MANIFEST, false),
     ["dependency_legacy"] = DependencyCase(LEGACY_MANIFEST, false),
@@ -1146,11 +1207,19 @@ def main() -> int:
     if failed:
         return 1
 
+    # Rust's registry defines parity for every exported version; the fixed
+    # goldens above independently pin the current legacy/chaining semantics.
+    expected = {
+        **EXPECTED,
+        "supported_versions": results["rust"]["supported_versions"],
+        "dependency_by_version": results["rust"]["dependency_by_version"],
+    }
     for name, got in results.items():
         mismatches = {
-            k: (EXPECTED[k], got.get(k)) for k in EXPECTED if got.get(k) != EXPECTED[k]
+            k: (expected[k], got.get(k)) for k in expected if got.get(k) != expected[k]
         }
         print(f"{name:8} {'ok' if not mismatches else 'MISMATCH'}")
+        print(f"         supported_versions: {got.get('supported_versions')!r}")
         for key, (want, actual) in sorted(mismatches.items()):
             print(f"         {key}: expected {want!r}, got {actual!r}", file=sys.stderr)
             failed = True
@@ -1159,7 +1228,10 @@ def main() -> int:
         print("\nlanguages disagree about the same inputs", file=sys.stderr)
         return 1
 
-    print(f"\nall {len(results)} languages agree across {len(EXPECTED)} assertions")
+    print(
+        f"\nall {len(results)} languages agree across {len(expected)} assertions"
+        f" ({len(expected['dependency_by_version'])} supported versions, blocked and clear)"
+    )
     return 0
 
 

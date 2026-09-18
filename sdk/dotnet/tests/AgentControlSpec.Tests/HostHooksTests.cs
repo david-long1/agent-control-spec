@@ -86,8 +86,7 @@ public sealed class HostHooksTests : IDisposable
         Assert.Equal("unsafe_content", denied.Reason);
     }
 
-    [Fact]
-    public async Task AnAnnotationWithNeedsRunsAfterAndSeesItsDependency()
+    private string WriteChainedFixture()
     {
         var bundle = Path.Combine(_dir, "chain-bundle");
         Directory.CreateDirectory(bundle);
@@ -128,7 +127,13 @@ public sealed class HostHooksTests : IDisposable
                   id: gate
                   query: data.acs.decision
             """);
+        return manifest;
+    }
 
+    [Fact]
+    public async Task AnAnnotationWithNeedsRunsAfterAndSeesItsDependency()
+    {
+        var manifest = WriteChainedFixture();
         var order = new List<string>();
         var seen = new List<string>();
 
@@ -157,6 +162,95 @@ public sealed class HostHooksTests : IDisposable
         Assert.Equal("""{"scan":{"spans":[1]}}""", seen[1]);
         Assert.Equal(Decision.Deny, verdict.Decision);
         Assert.Equal("judge_blocked", verdict.Reason);
+    }
+
+    [Fact]
+    public async Task ADependencyFailureSkipsItsDependentAndPolicy()
+    {
+        var manifest = WriteChainedFixture();
+        var order = new List<string>();
+        var policyCalled = false;
+
+        using var interceptor = AcsHostInterceptor.FromPath(
+            manifest,
+            annotator: (name, _, _) =>
+            {
+                order.Add(name);
+                if (name == "scan")
+                {
+                    throw new InvalidOperationException("classifier unreachable");
+                }
+                return """{"blocked":false}""";
+            },
+            policy: _ =>
+            {
+                policyCalled = true;
+                return """{"decision":"allow"}""";
+            });
+
+        var verdict = await interceptor.InterceptAsync(Input("leak"));
+
+        Assert.Equal(new[] { "scan" }, order);
+        Assert.False(policyCalled);
+        Assert.Equal(Decision.Deny, verdict.Decision);
+        Assert.Equal("runtime_error:annotation_failed", verdict.Reason);
+    }
+
+    [Fact]
+    public void AnUndeclaredAnnotationReadIsRejectedBeforeDispatch()
+    {
+        var manifest = WriteChainedFixture();
+        File.WriteAllText(manifest, File.ReadAllText(manifest).Replace(
+            "        needs: [scan]\n", ""));
+        var calls = new List<string>();
+
+        var error = Assert.Throws<AgentControlSpecNativeException>(() =>
+            AcsHostInterceptor.FromPath(
+                manifest,
+                annotator: (name, _, _) =>
+                {
+                    calls.Add(name);
+                    return "{}";
+                },
+                policy: _ =>
+                {
+                    calls.Add("policy");
+                    return """{"decision":"allow"}""";
+                }));
+
+        Assert.Equal(
+            "runtime_error:manifest_invalid: annotation 'judge' for intervention point input reads annotation 'scan' without naming it in needs",
+            error.Message);
+        Assert.Empty(calls);
+    }
+
+    [Fact]
+    public void AnAnnotationDependencyCycleIsRejectedBeforeDispatch()
+    {
+        var manifest = WriteChainedFixture();
+        File.WriteAllText(manifest, File.ReadAllText(manifest).Replace(
+            "      scan:\n        from: \"$target\"",
+            "      scan:\n        needs: [judge]\n        from: \"$target\""));
+        var calls = new List<string>();
+
+        var error = Assert.Throws<AgentControlSpecNativeException>(() =>
+            AcsHostInterceptor.FromPath(
+                manifest,
+                annotator: (name, _, _) =>
+                {
+                    calls.Add(name);
+                    return "{}";
+                },
+                policy: _ =>
+                {
+                    calls.Add("policy");
+                    return """{"decision":"allow"}""";
+                }));
+
+        Assert.Equal("runtime_error:manifest_invalid", error.Message.Split(": ")[0]);
+        Assert.Contains("cycle", error.Message);
+        Assert.Contains("judge, scan", error.Message);
+        Assert.Empty(calls);
     }
 
     [Fact]
