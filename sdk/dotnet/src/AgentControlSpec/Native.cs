@@ -485,7 +485,15 @@ internal static partial class Native
     private static partial IntPtr acs_manifest_parse(string yaml, out IntPtr errOut);
 
     [LibraryImport(Lib, StringMarshalling = StringMarshalling.Utf8)]
+    private static partial IntPtr acs_manifest_parse_with_limits(
+        string yaml, string? limitsJson, out IntPtr errOut);
+
+    [LibraryImport(Lib, StringMarshalling = StringMarshalling.Utf8)]
     private static partial IntPtr acs_manifest_merge(string yamlsJson, out IntPtr errOut);
+
+    [LibraryImport(Lib, StringMarshalling = StringMarshalling.Utf8)]
+    private static partial IntPtr acs_manifest_merge_with_limits(
+        string yamlsJson, string? limitsJson, out IntPtr errOut);
 
     [LibraryImport(Lib, StringMarshalling = StringMarshalling.Utf8)]
     private static partial IntPtr acs_manifest_diagnostics(string yaml, out IntPtr errOut);
@@ -531,16 +539,16 @@ internal static partial class Native
         }
     }
 
-    internal static string ManifestParse(string yaml)
+    internal static string ManifestParse(string yaml, string? limitsJson = null)
     {
-        var json = acs_manifest_parse(yaml, out var err);
+        var json = acs_manifest_parse_with_limits(yaml, limitsJson, out var err);
         ThrowIfError(err);
         return TakeString(json);
     }
 
-    internal static string ManifestMerge(string yamlsJson)
+    internal static string ManifestMerge(string yamlsJson, string? limitsJson = null)
     {
-        var json = acs_manifest_merge(yamlsJson, out var err);
+        var json = acs_manifest_merge_with_limits(yamlsJson, limitsJson, out var err);
         ThrowIfError(err);
         return TakeString(json);
     }

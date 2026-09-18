@@ -34,7 +34,7 @@
 - Add Rust `parse_yaml_str_with_limits`, `from_yaml_str_with_limits` and
   `from_yaml_chain_with_limits`; Python/Node manifest tooling accepts optional
   limits, FFI has additive `_with_limits` text functions, and .NET
-  `AcsManifest.Validate` accepts a limits dictionary. Existing no-options calls
+  `AcsManifest.Validate` and `AcsManifestTools.Parse`/`Merge` accept a limits dictionary. Existing no-options calls
   use defaults. Rust `Limits` gains six fields; exhaustive struct literals must
   supply them or use `..Limits::default()`. See [manifest parsing](docs/manifest-parsing.md) for contracts and
   dependency evidence.

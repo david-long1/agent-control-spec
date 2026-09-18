@@ -51,7 +51,8 @@ Python manifest tooling accepts `limits={"max_manifest_nodes": 200_000}`.
 Node's corresponding functions accept a second `Limits` argument. FFI exports
 `acs_validate_manifest_with_limits`, `acs_manifest_parse_with_limits` and
 `acs_manifest_merge_with_limits`, taking an optional JSON limits object.
-.NET supports `AcsManifest.Validate(source, dictionary)`. The other defaults
+.NET supports `AcsManifest.Validate(source, dictionary)` and limits overloads
+of `AcsManifestTools.Parse` and `Merge`. The other defaults
 remain unchanged when only one field is supplied.
 
 Grammar errors are `ManifestInvalid`; budget exhaustion is

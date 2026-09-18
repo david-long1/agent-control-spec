@@ -32,6 +32,19 @@ public sealed class AcsManifestTests
         Assert.Throws<AgentControlSpecNativeException>(() =>
             AcsManifest.Validate(Valid, new Dictionary<string, ulong> { ["max_manifest_nodes"] = 1 }));
         AcsManifest.Validate(Valid, new Dictionary<string, ulong> { ["max_policy_input_depth"] = 0 });
+        foreach (var operation in new Func<string, IReadOnlyDictionary<string, ulong>, string>[]
+        {
+            (text, limits) => AcsManifestTools.Parse(text, limits),
+            (text, limits) => AcsManifestTools.Merge([text], limits),
+        })
+        {
+            var failure = Assert.Throws<AgentControlSpecNativeException>(() =>
+                operation(source, new Dictionary<string, ulong>()));
+            Assert.Contains("runtime_error:resource_limit_exceeded", failure.Message);
+            Assert.NotEmpty(operation(source, new Dictionary<string, ulong> { ["max_merged_manifest_bytes"] = 2_097_152 }));
+            Assert.Throws<AgentControlSpecNativeException>(() =>
+                operation(Valid, new Dictionary<string, ulong> { ["max_manifest_nodes"] = 1 }));
+        }
     }
 
     [Fact]
