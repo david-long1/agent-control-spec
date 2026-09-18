@@ -28,7 +28,12 @@ from agent_hooks import Verdict
 
 from agent_control_spec import _native
 from agent_control_spec._evaluation import evaluate_wire as _evaluate_wire
-from agent_control_spec.async_interceptor import AsyncAcsInterceptor, Saturation, Scope
+from agent_control_spec.async_interceptor import (
+    AsyncAcsInterceptor,
+    AsyncAcsLoopMismatchError,
+    Saturation,
+    Scope,
+)
 
 __all__ = [
     "DEFAULT_LIMITS",
@@ -37,6 +42,7 @@ __all__ = [
     "ActivatedPolicy",
     "ArtifactDiagnostic",
     "AsyncAcsInterceptor",
+    "AsyncAcsLoopMismatchError",
     "ManifestInvalidError",
     "RegoBundle",
     "Saturation",
@@ -197,9 +203,11 @@ class AcsInterceptor:
       defaults field by field. Absent means keep every default; each
       field is individually optional, so a host raising one cap does
       not restate the other nine. A host feeding large payloads raises
-      ``max_snapshot_bytes``; one hardening against a hostile manifest
-      lowers ``max_extends_depth`` or ``manifest_url_timeout_ms``. Read
-      :data:`DEFAULT_LIMITS` to see the shipped values.
+      ``max_snapshot_bytes``. This synchronous constructor applies the
+      overrides to evaluation and bundled dispatchers, not manifest
+      loading. Use :class:`ActivatedPolicy` when loader caps such as
+      ``max_extends_depth`` must also apply. Read :data:`DEFAULT_LIMITS`
+      to see the shipped values.
 
     A dispatcher that raises does not silently no-op: the engine
     normalizes the failure into a fail-closed ``deny`` verdict with a

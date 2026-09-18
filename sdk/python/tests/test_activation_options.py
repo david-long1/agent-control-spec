@@ -12,13 +12,14 @@ from agent_control_spec import (
     AsyncAcsInterceptor,
 )
 from agent_hooks import AgentContextBuilder, InterceptionEmitter
-from test_async_interceptor import (
+
+from ._async_helpers import (
     BUNDLES,
     GatedAnnotator,
     entered,
     until,
 )
-from test_async_interceptor import (
+from ._async_helpers import (
     MANIFEST as ANNOTATOR_MANIFEST,
 )
 
@@ -189,7 +190,10 @@ def test_adapter_records_and_late_engine_telemetry_describe_different_outcomes()
             try:
                 await entered(gate)
                 rejected = await emitter.emit_unchecked(context())
-                assert rejected.verdict.reason == "acs_async_capacity_exceeded"
+                assert (
+                    rejected.verdict.reason
+                    == "runtime_error:acs_async_capacity_exceeded"
+                )
                 assert events == []
                 timed_out = await task
                 assert timed_out.verdict.reason == "host_error:interceptor_timeout"

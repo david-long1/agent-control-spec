@@ -75,30 +75,43 @@ The adapter does not put overflow evaluations into the executor queue.
 
 | Setting | Behavior at capacity |
 | --- | --- |
-| `on_saturation=Saturation.REJECT` (default) | Immediate deny, `acs_async_capacity_exceeded`. |
-| `on_saturation=Saturation.WAIT` | Wait up to `admission_timeout` (default 0.1 seconds), then deny `acs_async_admission_timeout`. |
-| Waiter count reaches `max_pending` (default 64) | Immediate deny, `acs_async_capacity_exceeded`. |
+| `on_saturation=Saturation.REJECT` (default) | Immediate deny, `runtime_error:acs_async_capacity_exceeded`. |
+| `on_saturation=Saturation.WAIT` | Wait up to `admission_timeout` (default 5 seconds), then deny `runtime_error:acs_async_admission_timeout`. |
+| Waiter count reaches `max_pending` (default 64) | Immediate deny, `runtime_error:acs_async_capacity_exceeded`. |
 
 Import `Saturation` from `agent_control_spec`; the equivalent strings
-`"reject"` and `"wait"` are also accepted. The short default admission
-wait limits added queue latency. Increase it explicitly when waiting
-longer is preferable to rejecting; the emitter still caps the total.
+`"reject"` and `"wait"` are also accepted. The five-second admission
+default matches the emitter's default interceptor budget. These are
+independent settings, not automatic deadline sharing. A shorter emitter
+timeout still caps the combined wait and evaluation; standalone calls
+retain a finite admission limit. Set a shorter admission timeout when
+earlier rejection is preferable.
 
-All these denials are final (no approval). The `acs_async_*` and
-`acs_point_unbound` reasons are diagnostic labels, not reserved or
-authenticated producer identifiers. A policy can return the same
-reason. A record reader must not infer adapter-versus-policy provenance
-from the reason alone. Both denials have the same enforcement effect;
-their internal origin is not an authorization input. This keeps the
-existing closed reserved-reason contract unchanged. Authenticating the
-origin would require a separately agreed, policy-unforgeable marker.
+Admission uses elapsed time, including event-loop delays, through
+submission of a queued call. A busy loop can consume the budget even
+after a worker becomes free. Expired queued calls are not submitted.
+Choose a budget that accounts for expected evaluation latency, queue
+depth and host-loop work; a longer timeout does not create capacity.
+
+All these denials are final (no approval). The three
+`runtime_error:acs_async_*` reasons are reserved for the `sdk-adapter`
+producer. ACS rejects policy output that tries to use them, so a
+policy cannot impersonate these adapter failures.
+
+`acs_point_unbound` remains an ordinary diagnostic label on an allow,
+not a runtime error. A policy can return that label too; it does not
+provide authenticated attribution for a scope bypass.
 
 The read-only `control.in_flight`, `control.waiting`, and
 `control.closed` properties expose current occupancy and whether closing
 has started. Read them on the adapter's event loop; `closed` can be true
-while active calls are draining. Waiters are bounded,
-but FIFO fairness is not promised. Configuration must use positive
-integer capacities and a finite positive admission timeout.
+while active calls are draining. Eligible waiters receive slots in FIFO
+order; new calls cannot overtake a waiter whose slot was just granted.
+This is admission order, not execution or completion order across workers.
+`waiting` excludes granted reservations, while `in_flight` counts
+submitted calls, so their sum can briefly exclude reserved slots.
+Configuration must use positive integer capacities and a finite positive
+admission timeout.
 
 The emitter timeout covers admission **and** the awaited evaluation.
 Its expiry yields `host_error:interceptor_timeout`. Caller cancellation
@@ -107,17 +120,29 @@ capacity stays occupied until that call actually returns. A timed-out
 call's eventual verdict cannot authorize the abandoned action.
 
 Use `async with` or `await control.aclose()`. Closing wakes queued
-waiters and rejects new calls with `acs_async_closed`, drains active
+waiters and rejects new calls with `runtime_error:acs_async_closed`, drains active
 work, and joins the executor without blocking the loop. Cancellation
 of `aclose()` leaves cleanup running; await it again before closing the
-loop. An operation that never returns can prevent draining indefinitely.
+loop. An operation that never returns can prevent draining and interpreter
+exit indefinitely: the interpreter joins the executor's worker threads.
+Even `shutdown(wait=False)` cannot forcibly stop a running native callback.
 Do not create a replacement adapter per timeout: that would defeat the
-capacity bound. An adapter belongs to one event loop; cross-loop use
-raises an error.
-Closing the event loop first prevents completion callbacks from updating
-accounting and can leave the pool alive until the adapter is collected.
-There is no cross-loop recovery API; keep the owning loop alive until
-`aclose()` finishes.
+capacity bound. An adapter belongs to one event loop. A direct cross-loop
+call raises `AsyncAcsLoopMismatchError` (a `RuntimeError` subclass);
+through the emitter it produces a recorded `host_error:interceptor_failed`
+denial with that exception type as its message.
+Prefer closing the adapter before the owning loop. If that loop has
+already closed, call `control.close()` synchronously, or await
+`control.aclose()` from a replacement loop. Both reject further work,
+cancel native work that has not started, join running workers, and clear
+the abandoned loop's bookkeeping after native completion. Late worker
+exceptions are still reported by type. Recovery does not make evaluation
+on another loop valid.
+
+`close()` can block while native work finishes. Never call it while the
+owning loop is still open, even if temporarily stopped; use that loop's
+`aclose()` instead. Cancelling an `aclose()` recovery awaiter does not
+stop its shutdown thread. Recovery cannot terminate a hung callback.
 
 Context variables are copied to evaluation workers. Custom annotator,
 policy, and telemetry callbacks must be thread-safe. Unexpected worker
@@ -160,13 +185,6 @@ policy work, and callback overhead. There is no universal wall-clock
 bound when arbitrary host callbacks are involved. Eight lifecycle
 points do not imply eight annotator calls: only each point's configured
 `annotations` request annotation work.
-
-The adapter and its private `_evaluation` helper can run as source-supplied
-modules over the released
-`agent-control-spec==0.4.0a3` and `agent-hooks-sdk==0.1.0a5`; it is not
-itself included in that release. The activation options below require
-the new native build. Publishing the earlier GIL fix (#56) alone does
-not provide this async integration.
 
 ## Activating a policy version
 
