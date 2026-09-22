@@ -21,7 +21,7 @@
   "policy_response": {
     "decision": "transform",
     "reason": "pii_redaction",
-    "message": "redacted 2 spans; one verification pointer per span",
+    "message": "PII redacted; one verification pointer per redacted span",
     "transform": {
       "path": "$target.text",
       "value": "ticket 4821: customer [REDACTED] asked to move 9,400.00 to account [REDACTED]"
@@ -285,7 +285,7 @@
   "expected": {
     "decision": "transform",
     "reason": "pii_redaction",
-    "message": "redacted 2 spans; one verification pointer per span",
+    "message": "PII redacted; one verification pointer per redacted span",
     "transformed_policy_target": {
       "text": "ticket 4821: customer [REDACTED] asked to move 9,400.00 to account [REDACTED]"
     },
