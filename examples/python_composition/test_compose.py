@@ -12,6 +12,7 @@ import re
 import subprocess
 import sys
 import unittest
+from importlib.metadata import version
 
 from agent_control_spec import AcsInterceptor, ActivatedPolicy
 from agent_hooks import (
@@ -100,7 +101,9 @@ class SdkTests(unittest.TestCase):
 
     def test_sdk_readme_python_blocks(self):
         readme = (ROOT / "sdk/python/README.md").read_text()
-        blocks = re.findall(r"```python\n(.*?)\n```", readme, re.DOTALL)
+        runtime, separator, _ = readme.partition("## Authoring inspection\n")
+        self.assertTrue(separator)
+        blocks = re.findall(r"```python\n(.*?)\n```", runtime, re.DOTALL)
         self.assertEqual(len(blocks), 5)
         result = subprocess.run(
             [
@@ -118,6 +121,25 @@ class SdkTests(unittest.TestCase):
         self.assertIn("'decision': 'allow'", result.stdout)
         self.assertIn("'decision': 'transform'", result.stdout)
         self.assertIn("'value': 100", result.stdout)
+
+    def test_sdk_readme_authoring_block(self):
+        readme = (ROOT / "sdk/python/README.md").read_text()
+        _, separator, authoring = readme.partition("## Authoring inspection\n")
+        self.assertTrue(separator)
+        blocks = re.findall(r"```python\n(.*?)\n```", authoring, re.DOTALL)
+        self.assertEqual(len(blocks), 1)
+        if version("agent-control-spec") == "0.4.0a3":
+            self.skipTest(
+                "Authoring first ships in alpha.4, not the published alpha.3 baseline"
+            )
+        subprocess.run(
+            [sys.executable, "-c", blocks[0] + "\nassert module\n"],
+            cwd=ROOT,
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
 
     def test_documentation_links(self):
         for relative in (
