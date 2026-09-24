@@ -73,6 +73,33 @@
   Generator iteration warnings cover wildcard and unbound-index lookups across
   collections. Leading unary-minus condition bodies are rejected before they can
   attach to a generated guard across a newline.
+- `CedarRequest.context` replaces `CedarRequest.context_keys` and holds
+  the Cedar JSON value the mapping produces. `CedarPolicyInvocation` drops
+  its never populated `query` field. A cedar policy that sets `query`, or
+  a cedar binding with any field other than `id`, now fails with
+  `runtime_error:manifest_invalid` instead of being ignored.
+- The bundled Cedar dispatcher evaluated every request with an empty
+  context, mapped every `Deny` to `no_matching_policy` and ignored
+  `@advice`. Every `has` guarded `forbid` in the shipped `policy/cedar-lib`
+  failed open, an unguarded read failed closed, a context-gated `permit`
+  never allowed, and the library's escalate, transform and warn permits
+  were plain allows. The dispatcher now builds the context from the
+  snapshot, `envelope` included, plus the annotations as one nested
+  `annotations` record; takes the deny reason from the `@id` of the first
+  contributing `forbid`; translates the `@advice` of every contributing
+  `permit`, the most restrictive winning; and fails closed on an
+  evaluation error in any policy. Specification 12.4 states the value
+  rules: a float becomes a `decimal`, a null record member drops, a null
+  set element fails closed, and a value Cedar cannot hold or a key its
+  JSON format reserves fails closed with a detail that names the key and
+  not the value. A schema now has to declare the context shape for each
+  action; the dispatcher builds the context without the schema and checks
+  it against the schema afterwards, so a schema cannot turn snapshot data
+  into an entity reference. Advice with a member outside
+  `cedar_advice.schema.json` fails closed with
+  `runtime_error:policy_output_invalid`. Closes #83.
+- A `cedar-lib` CI job runs the library's own Cedar test corpus with a
+  pinned, checksum-verified `cedar-policy-cli`.
 - A manifest chain that fetches any `extends` URL is now URL sourced, and a
   URL sourced manifest may not read host secrets. A fetched document could
   name a host environment variable through `api_key_env` or one of the
