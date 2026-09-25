@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- `RELEASING.md` now says the `runtime_error:acs_async_*` reasons ship in
+  specification `0.5.0-alpha.1`. It had called that minor bump pending;
+  #78 made it.
+  `spec/reserved-reasons.json` now lists the four AGT host side resolution
+  reasons under producer `agt-resolution`, and its cause text for the two
+  transform reasons matches section 16. An engine test pins both section 16
+  tables to the inventory: same reason set, same producer, same cause text.
+  Closes #97.
+- Thanks to david-long1 for the Rust 1.89 minimum report (#85) and the
+  oversize evidence conformance vector (#89).
 - Replace archived `serde_yaml` and its transpiled libyaml dependency with
   `serde-saphyr` (caret `1.2`, locked to `1.2.0`) and `granit-parser` `1.2.1`.
   Building the engine requires Rust 1.89, now checked in CI. Regorus YAML
@@ -56,6 +66,58 @@
   use defaults. Rust `Limits` gains six fields; exhaustive struct literals must
   supply them or use `..Limits::default()`. See [manifest parsing](docs/manifest-parsing.md) for contracts and
   dependency evidence.
+- Manifest contract `0.5.0-alpha.1` adds annotator chaining through point-binding
+  `needs`: dependencies run first, and consumers can read their outputs through
+  `$pi.annotations.<name>`. Legacy `0.4.0-alpha.1` semantics stay unchanged.
+  Migrate an entire `extends` chain together and rename any host-specific
+  `needs` setting first; see specification sections 2.1 and 10.1.
+  This is an unreleased contract change, not a release or package bump;
+  package versions remain `0.4.0-alpha.4`.
+  The manifest schema now rejects unsupported versions rather than leaving that
+  check solely to the runtime. Version validation and composition use the Unicode
+  `White_Space` property when trimming surrounding characters.
+  The runtime prepares dependency order and metadata once at construction and
+  reuses one staged snapshot copy per evaluation. Consumers still copy their
+  dependency outputs, so dispatch cost grows with the volume of those outputs.
+  Staged depth checks visit only the replaced annotations member, preserving
+  its depth under the policy-input root without rescanning the snapshot.
+  In a local release benchmark with 50 no-op annotators, a 50,000-element
+  array snapshot, and 100 measured evaluations after warmup, median chain/flat
+  time fell from 2.92x to 1.45x (51.3/17.6 ms to 25.4/17.6 ms).
+  Those figures describe that workload, not a general latency guarantee.
+- Python adds `AsyncAcsInterceptor` over an `ActivatedPolicy`: awaitable
+  interception, a dedicated bounded worker pool, reject or bounded-wait
+  admission, and draining async shutdown. Emitter timeout/cancellation
+  does not free capacity until native evaluation returns. Strict scope
+  remains the default; `Scope.BOUND_POINTS_ONLY` explicitly skips valid
+  lifecycle points outside this control without weakening bound-point
+  failures or suppressing other controls. This is separate from the GIL
+  fix below and does not change the manifest grammar.
+  Scope bypasses carry `acs_point_unbound` in per-interceptor records;
+  that allow label remains diagnostic. The three adapter admission
+  denials use reserved `runtime_error:acs_async_*` reasons attributed
+  to `sdk-adapter`, which policy output cannot imitate.
+  `Saturation` names the admission modes, and read-only `in_flight`,
+  `waiting`, and `closed` properties expose pool state. Each admitted
+  call serializes the context once on the loop thread; workers receive
+  an immutable string.
+  WAIT admission is FIFO, reserves slots before waking callers, and
+  defaults to five seconds. Cancellation or failed submission returns
+  an unused reservation to the next eligible waiter.
+  If the owning loop has already closed, `close()` joins workers
+  synchronously; `aclose()` on a replacement loop performs that recovery
+  off-loop. Cross-loop evaluation remains rejected.
+  The three reserved admission reasons are an explicit, narrow draft
+  contract exception to the host-error guidance, not a general namespace
+  change. They ship in specification `0.5.0-alpha.1`.
+- All Python `ActivatedPolicy` constructors now accept `telemetry_sink`,
+  `perf_telemetry`, and `limits`, preserving these settings through
+  async evaluation. Both file and in-memory activation apply host limits
+  to bundled dispatchers. File activation also applies them to manifest
+  loading. Existing calls keep their defaults.
+- Regenerated the Python development lockfile from its requirements:
+  it now installs the declared Agent Hooks `0.1.0a5` and maturin
+  `1.15.0`, rather than the stale `0.1.0a3` / `1.8.7` pins.
 - Add the optional `agent-control-spec-generator` package and `acs-policy-gen`
   command, porting AGT's natural-language authoring flow. It writes draft
   manifests, Rego and a review report without approving or activating policy.

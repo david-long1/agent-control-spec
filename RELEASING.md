@@ -34,6 +34,27 @@ the tag's publication set. The tag workflow does not publish the generator.
    All legs are idempotent: already-published versions are skipped, so
    a re-run after a partial failure is safe.
 
+## Async adapter contract changes
+
+PR #68 deliberately adds the three `runtime_error:acs_async_*`
+admission reasons to the draft specification and its producer inventory.
+Section 16's exception is limited to these interceptor-produced denials.
+The emitter keeps its `host_error:*` obligations; the scope-allow label
+is not a reserved error.
+
+The three reasons ship in specification `0.5.0-alpha.1`. Section 22
+requires a minor bump for an added reserved reason; the annotator
+dependency change (#78) made that bump. Legacy manifest contract
+`0.4.0-alpha.1` stays supported (section 2.1). The test
+`reserved_reason_tables_match_inventory` in
+`engine/tests/security_conformance.rs` fails when the section 16 tables
+and `spec/reserved-reasons.json` disagree.
+
+Runtime package metadata (`0.4.0-alpha.4`) and the specification
+identifier are separate version surfaces. Neither ships before the
+tag. Before tagging, confirm the supported versions, schema,
+fixtures and compatibility cases still match section 2.1.
+
 ## Generator compatibility
 
 The generator and runtime use lockstep version metadata. The generator's minimum
